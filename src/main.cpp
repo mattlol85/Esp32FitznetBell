@@ -122,20 +122,20 @@ void sendButtonEvent(const char* eventType) {
 }
 
 // ---------- Helper: send a CONNECTED status (no buttonEvent field) ----------
-void sendConnectedStatus() {
-  if (!webSocket.connected()) {
-    return;
-  }
+// void sendConnectedStatus() {
+//   if (!webSocket.connected()) {
+//     return;
+//   }
 
-  String msg = "{\"type\":\"CONNECTED\",\"deviceId\":\"device-1234\"}";
+//   String msg = "{\"type\":\"CONNECTED\",\"deviceId\":\"device-1234\"}";
 
-  Serial.print("Sending (status): ");
-  Serial.println(msg);
+//   Serial.print("Sending (status): ");
+//   Serial.println(msg);
 
-  webSocket.beginMessage(TYPE_TEXT);
-  webSocket.print(msg);
-  webSocket.endMessage();
-}
+//   webSocket.beginMessage(TYPE_TEXT);
+//   webSocket.print(msg);
+//   webSocket.endMessage();
+// }
 
 // ---------- WiFi connect (using WiFiManager) ----------
 void connectToWiFi() {
