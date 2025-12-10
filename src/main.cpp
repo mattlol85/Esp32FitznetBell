@@ -217,7 +217,7 @@ void handleIncomingMessages() {
     Serial.println();
 
     // Parse JSON
-    StaticJsonDocument<256> doc;
+    JsonDocument doc;
     DeserializationError error = deserializeJson(doc, msg);
 
     if (!error) {
