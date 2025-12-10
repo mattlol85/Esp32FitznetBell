@@ -194,7 +194,7 @@ void connectToWebSocket() {
     ESP_LOGI(TAG, "WebSocket connected!");
     setStatus("Ready");
     // ✅ status message that won't break enum deserialization
-    sendConnectedStatus();
+    // sendConnectedStatus();
   } else {
     ESP_LOGE(TAG, "WebSocket connection failed");
     setStatus("WS Failed");
