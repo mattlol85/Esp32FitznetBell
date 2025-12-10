@@ -1,5 +1,5 @@
 #include <WiFi.h> 
-#include <ArduinoHttpClient.h> 
+#include <WebSocketsClient.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -8,6 +8,10 @@
 #include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
 #include <Preferences.h>
 #include "esp_log.h"
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+
+#define CURRENT_VERSION "v0.1.0"
 
 static const char* TAG = "FitzBell";
 
@@ -29,14 +33,15 @@ const char wsPath[]        = "/ws";            // WebSocket path
 // -------- Hardware pin for the button --------
 #define BUTTON_PIN 13   // GPIO pin for the button (to GND with INPUT_PULLUP)
 
-// Underlying TCP client
-WiFiClient wifiClient;
-
-// WebSocket client from ArduinoHttpClient
-WebSocketClient webSocket(wifiClient, serverAddress, serverPort);
+// WebSocket client
+WebSocketsClient webSocket;
 
 // Track button state to prevent duplicate messages
 bool buttonPressed = false;
+
+// Update Scheduler
+unsigned long lastUpdateCheck = 0;
+const unsigned long updateInterval = 30000; // 30 seconds
 
 // Global display state
 String statusMessage = "Booting...";
@@ -86,22 +91,15 @@ void setStatus(String msg) {
 
 // ---------- Helper: send JSON over WebSocket (button events) ----------
 void sendButtonEvent(const char* eventType) {
-  if (!webSocket.connected()) {
-    ESP_LOGW(TAG, "Not sending, WebSocket not connected");
-    setStatus("WS Disconnected");
-    return;
-  }
-
   // Build JSON string for ButtonEventDto
-  // { "buttonEvent": "PRESSED", "deviceId": "Matt" }
+  // { "buttonEvent": "PRESSED", "deviceId": "Matt", "firmwareVersion": "v1.0.0" }
   String json = String("{\"buttonEvent\":\"") + eventType +
-                "\",\"deviceId\":\"" + userId + "\"}";
+                "\",\"deviceId\":\"" + userId + 
+                "\",\"firmwareVersion\":\"" + CURRENT_VERSION + "\"}";
 
   ESP_LOGI(TAG, "Sending: %s", json.c_str());
 
-  webSocket.beginMessage(TYPE_TEXT);  // text frame
-  webSocket.print(json);
-  webSocket.endMessage();
+  webSocket.sendTXT(json);
 
   // Update local list immediately for responsiveness
   bool found = false;
@@ -182,81 +180,130 @@ void connectToWiFi() {
   }
 }
 
-// ---------- WebSocket connect ----------
-void connectToWebSocket() {
-  ESP_LOGI(TAG, "Connecting to WebSocket...");
-  setStatus("WS Connecting...");
+// ---------- WebSocket Event Handler ----------
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+    switch(type) {
+        case WStype_DISCONNECTED:
+            ESP_LOGW(TAG, "WS Disconnected");
+            setStatus("WS Disconnected");
+            break;
+        case WStype_CONNECTED:
+            ESP_LOGI(TAG, "WS Connected");
+            setStatus("Ready");
+            break;
+        case WStype_TEXT:
+            Serial.printf("Received: %s\n", payload);
+            
+            // Parse JSON
+            JsonDocument doc;
+            DeserializationError error = deserializeJson(doc, payload);
 
-  // Perform WebSocket handshake
-  webSocket.begin(wsPath);  // can pass path here, e.g. "/ws"
+            if (!error) {
+              const char* evt = doc["buttonEvent"];
+              const char* user = doc["userId"];
+              const char* device = doc["deviceId"];
 
-  if (webSocket.connected()) {
-    ESP_LOGI(TAG, "WebSocket connected!");
-    setStatus("Ready");
-    // ✅ status message that won't break enum deserialization
-    // sendConnectedStatus();
-  } else {
-    ESP_LOGE(TAG, "WebSocket connection failed");
-    setStatus("WS Failed");
-  }
+              String displayName = (user) ? String(user) : ((device) ? String(device) : "Unknown");
+
+              if (evt) {
+                if (strcmp(evt, "PRESSED") == 0) {
+                   bool exists = false;
+                   for(const auto& u : activeUsers) { if(u == displayName) exists = true; }
+                   if(!exists) activeUsers.push_back(displayName);
+                } else if (strcmp(evt, "RELEASED") == 0) {
+                   for (int i = 0; i < activeUsers.size(); i++) {
+                     if (activeUsers[i] == displayName) {
+                       activeUsers.erase(activeUsers.begin() + i);
+                       break;
+                     }
+                   }
+                }
+                lastWsMessage = displayName + " " + evt;
+              } else {
+                lastWsMessage = "Msg Recv";
+              }
+            } else {
+              lastWsMessage = "Parse Error";
+            }
+            updateScreen();
+            break;
+    }
 }
 
-// ---------- Handle incoming messages ----------
-void handleIncomingMessages() {
-  // parseMessage() checks if there's a complete frame available
-  int messageSize = webSocket.parseMessage();
-  if (messageSize > 0) {
-    Serial.print("Received message: ");
-    String msg;
+// ---------- Firmware Update Logic ----------
+void updateProgress(int cur, int total) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Firmware Update");
+  
+  display.setCursor(0, 20);
+  display.println("Downloading...");
+  
+  int percent = (cur * 100) / total;
+  display.setCursor(0, 35);
+  display.print(percent);
+  display.println("%");
+  
+  // Progress bar
+  display.drawRect(0, 50, 128, 10, SSD1306_WHITE);
+  display.fillRect(2, 52, map(percent, 0, 100, 0, 124), 6, SSD1306_WHITE);
+  
+  display.display();
+}
 
-    while (webSocket.available()) {
-      char c = webSocket.read();
-      Serial.print(c);
-      msg += c;
-    }
-    Serial.println();
+void checkFirmwareUpdate() {
+  setStatus("Checking Update...");
+  ESP_LOGI(TAG, "Checking for firmware updates...");
 
-    // Parse JSON
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, msg);
+  WiFiClient client;
+  
+  // Build URL: http://192.168.1.164:8080/api/firmware/latest
+  String updateUrl = "http://" + String(serverAddress) + ":" + String(serverPort) + "/api/firmware/latest";
 
-    if (!error) {
-      const char* evt = doc["buttonEvent"];
-      const char* user = doc["userId"]; // Assuming server sends userId
-      const char* device = doc["deviceId"];
+  // Register callback for progress bar
+  httpUpdate.onProgress(updateProgress);
+  
+  // Increase timeout for large files (default is often too short)
+  client.setTimeout(12000); 
 
-      // Fallback if no userId
-      String displayName = (user) ? String(user) : ((device) ? String(device) : "Unknown");
+  // Check and update
+  // This sends 'x-ESP32-version: <CURRENT_VERSION>' header
+  // We also set followRedirects to true just in case
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  
+  t_httpUpdate_return ret = httpUpdate.update(client, updateUrl, CURRENT_VERSION);
 
-      if (evt) {
-        if (strcmp(evt, "PRESSED") == 0) {
-           bool exists = false;
-           for(const auto& u : activeUsers) { if(u == displayName) exists = true; }
-           if(!exists) activeUsers.push_back(displayName);
-        } else if (strcmp(evt, "RELEASED") == 0) {
-           for (int i = 0; i < activeUsers.size(); i++) {
-             if (activeUsers[i] == displayName) {
-               activeUsers.erase(activeUsers.begin() + i);
-               break;
-             }
-           }
-        }
-        lastWsMessage = displayName + " " + evt;
-      } else {
-        // Generic message
-        lastWsMessage = "Msg Recv";
-      }
-    } else {
-      lastWsMessage = "Parse Error";
-    }
-    updateScreen();
+  switch (ret) {
+    case HTTP_UPDATE_FAILED:
+      ESP_LOGE(TAG, "Update failed: %s", httpUpdate.getLastErrorString().c_str());
+      setStatus("Update Failed");
+      delay(2000);
+      break;
+
+    case HTTP_UPDATE_NO_UPDATES:
+      ESP_LOGI(TAG, "No updates available");
+      setStatus("Up to Date");
+      delay(1000);
+      break;
+
+    case HTTP_UPDATE_OK:
+      ESP_LOGI(TAG, "Update installed");
+      // Device will restart automatically
+      break;
   }
 }
 
 // ---------- Arduino setup ----------
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  
+  // Give the serial monitor a moment to hook up
+  delay(1000); 
+  Serial.println("\n\n=====================================");
+  Serial.println("FitzBell Booting...");
+  Serial.println("Firmware Version: " CURRENT_VERSION);
+  Serial.println("=====================================\n");
 
   // I2C Scanner
   Wire.begin();
@@ -302,14 +349,24 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);  // button to GND, internal pull-up
 
   connectToWiFi();
-  connectToWebSocket();
+  checkFirmwareUpdate();
+  
+  // Init WebSocket
+  webSocket.begin(serverAddress, serverPort, wsPath);
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
 }
 
 // ---------- Arduino loop ----------
 void loop() {
-  // Reconnect WebSocket if needed
-  if (!webSocket.connected()) {
-    connectToWebSocket();
+  webSocket.loop();
+
+  // Check for updates periodically
+  if (millis() - lastUpdateCheck >= updateInterval) {
+    lastUpdateCheck = millis();
+    checkFirmwareUpdate();
+    // Restore screen after check (if no update happened)
+    updateScreen(); 
   }
 
   // Read button state (active LOW)
@@ -329,8 +386,5 @@ void loop() {
     sendButtonEvent("RELEASED");
   }
 
-  // Check for any incoming messages
-  handleIncomingMessages();
-
-  delay(50);  // simple debounce + loop pacing
+  delay(50);  
 }
