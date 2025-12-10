@@ -5,6 +5,8 @@
 #include <Adafruit_SSD1306.h>
 #include <ArduinoJson.h>
 #include <vector>
+#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
+#include <Preferences.h>
 
 // -------- OLED Display --------
 #define SCREEN_WIDTH 128
@@ -12,15 +14,12 @@
 #define OLED_RESET    -1 // Reset pin # (or -1 if sharing Arduino reset pin)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// -------- WiFi credentials --------
-const char* ssid     = "WIFI HERE";
-const char* password = "PASSWORD HERE";
-
 // -------- Device User --------
-const char* userId   = "Lauren";
+char userId[40] = "Guest"; // Mutable buffer for user ID
+Preferences preferences;   // For saving userId to NVS
 
 // -------- WebSocket server details --------
-const char serverAddress[] = "192.168.1.182";  // Your server IP / hostname
+const char serverAddress[] = "192.168.1.164";  // Your server IP / hostname
 const int  serverPort      = 8080;             // Your server port
 const char wsPath[]        = "/ws";            // WebSocket path
 
@@ -136,25 +135,49 @@ void sendConnectedStatus() {
   webSocket.endMessage();
 }
 
-// ---------- WiFi connect ----------
+// ---------- WiFi connect (using WiFiManager) ----------
 void connectToWiFi() {
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(ssid);
+  setStatus("Configuring WiFi...");
 
-  setStatus("WiFi Connecting...");
+  WiFiManager wm;
 
-  WiFi.begin(ssid, password);
+  // Custom parameter for User ID
+  // id, placeholder, default, length
+  WiFiManagerParameter custom_userid("userid", "Enter User Name", userId, 40);
+  wm.addParameter(&custom_userid);
 
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(500);
+  // Callback to save params
+  wm.setSaveParamsCallback([&]() {
+    Serial.println("Saving params");
+    strcpy(userId, custom_userid.getValue());
+    preferences.begin("app-config", false);
+    preferences.putString("userId", userId);
+    preferences.end();
+  });
+
+  // If you want to reset settings for testing, uncomment:
+  wm.resetSettings();
+
+  // Automatically connect using saved credentials,
+  // if connection fails, it starts an access point with the specified name
+  bool res = wm.autoConnect("FitzNetBell-Setup"); 
+
+  if(!res) {
+    Serial.println("Failed to connect");
+    setStatus("WiFi Failed");
+    // ESP.restart();
+  } 
+  else {
+    // If you get here you have connected to the WiFi
+    Serial.println("connected...yeey :)");
+    setStatus("WiFi Connected");
+    
+    // Read updated parameter if it was just saved
+    // (The callback handles saving, but we ensure our runtime var is current)
+    if (strlen(custom_userid.getValue()) > 0) {
+       strcpy(userId, custom_userid.getValue());
+    }
   }
-
-  Serial.println("\nWiFi connected!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-
-  setStatus("WiFi Connected");
 }
 
 // ---------- WebSocket connect ----------
@@ -267,6 +290,12 @@ void setup() {
   display.setCursor(10, 30);
   display.println("Initializing...");
   display.display();
+
+  // Load saved user ID
+  preferences.begin("app-config", true); // Read-only mode
+  String savedId = preferences.getString("userId", "Guest");
+  savedId.toCharArray(userId, 40);
+  preferences.end();
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);  // button to GND, internal pull-up
 
