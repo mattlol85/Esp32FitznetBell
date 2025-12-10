@@ -7,6 +7,9 @@
 #include <vector>
 #include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
 #include <Preferences.h>
+#include "esp_log.h"
+
+static const char* TAG = "FitzBell";
 
 // -------- OLED Display --------
 #define SCREEN_WIDTH 128
@@ -84,7 +87,7 @@ void setStatus(String msg) {
 // ---------- Helper: send JSON over WebSocket (button events) ----------
 void sendButtonEvent(const char* eventType) {
   if (!webSocket.connected()) {
-    Serial.println("Not sending, WebSocket not connected");
+    ESP_LOGW(TAG, "Not sending, WebSocket not connected");
     setStatus("WS Disconnected");
     return;
   }
@@ -94,8 +97,7 @@ void sendButtonEvent(const char* eventType) {
   String json = String("{\"buttonEvent\":\"") + eventType +
                 "\",\"deviceId\":\"" + userId + "\"}";
 
-  Serial.print("Sending: ");
-  Serial.println(json);
+  ESP_LOGI(TAG, "Sending: %s", json.c_str());
 
   webSocket.beginMessage(TYPE_TEXT);  // text frame
   webSocket.print(json);
@@ -156,7 +158,7 @@ void connectToWiFi() {
   });
 
   // If you want to reset settings for testing, uncomment:
-  wm.resetSettings();
+  // wm.resetSettings();
 
   // Automatically connect using saved credentials,
   // if connection fails, it starts an access point with the specified name
@@ -169,7 +171,7 @@ void connectToWiFi() {
   } 
   else {
     // If you get here you have connected to the WiFi
-    Serial.println("connected...yeey :)");
+    Serial.println("Connected to WiFi!");
     setStatus("WiFi Connected");
     
     // Read updated parameter if it was just saved
@@ -182,19 +184,19 @@ void connectToWiFi() {
 
 // ---------- WebSocket connect ----------
 void connectToWebSocket() {
-  Serial.println("Connecting to WebSocket...");
+  ESP_LOGI(TAG, "Connecting to WebSocket...");
   setStatus("WS Connecting...");
 
   // Perform WebSocket handshake
   webSocket.begin(wsPath);  // can pass path here, e.g. "/ws"
 
   if (webSocket.connected()) {
-    Serial.println("WebSocket connected!");
+    ESP_LOGI(TAG, "WebSocket connected!");
     setStatus("Ready");
     // ✅ status message that won't break enum deserialization
     sendConnectedStatus();
   } else {
-    Serial.println("WebSocket connection failed");
+    ESP_LOGE(TAG, "WebSocket connection failed");
     setStatus("WS Failed");
   }
 }
