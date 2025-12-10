@@ -252,8 +252,8 @@ void updateProgress(int cur, int total) {
   display.display();
 }
 
-void checkFirmwareUpdate() {
-  setStatus("Checking Update...");
+void checkFirmwareUpdate(bool silent) {
+  if (!silent) setStatus("Checking Update...");
   ESP_LOGI(TAG, "Checking for firmware updates...");
 
   WiFiClient client;
@@ -277,14 +277,21 @@ void checkFirmwareUpdate() {
   switch (ret) {
     case HTTP_UPDATE_FAILED:
       ESP_LOGE(TAG, "Update failed: %s", httpUpdate.getLastErrorString().c_str());
-      setStatus("Update Failed");
-      delay(2000);
+      if (!silent) {
+        setStatus("Update Failed");
+        delay(2000);
+      } else {
+        // Restore screen in case progress bar was shown
+        updateScreen();
+      }
       break;
 
     case HTTP_UPDATE_NO_UPDATES:
       ESP_LOGI(TAG, "No updates available");
-      setStatus("Up to Date");
-      delay(1000);
+      if (!silent) {
+        setStatus("Up to Date");
+        delay(1000);
+      }
       break;
 
     case HTTP_UPDATE_OK:
@@ -349,7 +356,7 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);  // button to GND, internal pull-up
 
   connectToWiFi();
-  checkFirmwareUpdate();
+  checkFirmwareUpdate(false);
   
   // Init WebSocket
   webSocket.begin(serverAddress, serverPort, wsPath);
@@ -364,9 +371,7 @@ void loop() {
   // Check for updates periodically
   if (millis() - lastUpdateCheck >= updateInterval) {
     lastUpdateCheck = millis();
-    checkFirmwareUpdate();
-    // Restore screen after check (if no update happened)
-    updateScreen(); 
+    checkFirmwareUpdate(true);
   }
 
   // Read button state (active LOW)
