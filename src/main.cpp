@@ -11,7 +11,7 @@
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 
-#define CURRENT_VERSION "v0.3.0"
+#define CURRENT_VERSION "v0.4.0"
 
 static const char* TAG = "FitzBell";
 
