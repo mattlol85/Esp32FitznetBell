@@ -10,10 +10,25 @@
 #include "esp_log.h"
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
+#include <FastLED.h>
 
 #define CURRENT_VERSION "v0.4.0"
 
 static const char* TAG = "FitzBell";
+
+// -------- LED Strip --------
+#define LED_PIN     5
+#define NUM_LEDS    3
+#define BRIGHTNESS  64
+#define LED_TYPE    WS2812B
+#define COLOR_ORDER GRB
+CRGB leds[NUM_LEDS];
+
+// -------- LED Helper --------
+void setLedColor(CRGB color) {
+  fill_solid(leds, NUM_LEDS, color);
+  FastLED.show();
+}
 
 // -------- OLED Display --------
 #define SCREEN_WIDTH 128
@@ -314,6 +329,12 @@ void setup() {
   Serial.println("FitzBell Booting...");
   Serial.println("Firmware Version: " CURRENT_VERSION);
   Serial.println("=====================================\n");
+
+  // LED Init
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
+  FastLED.setBrightness(BRIGHTNESS);
+  // Startup color
+  setLedColor(CRGB::Blue);
 
   // I2C Scanner
   Wire.begin();
