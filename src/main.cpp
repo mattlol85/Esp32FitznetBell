@@ -43,9 +43,14 @@ bool buttonPressed = false;
 unsigned long lastUpdateCheck = 0;
 const unsigned long updateInterval = 30000; // 30 seconds
 
+// Count Polling
+unsigned long lastCountCheck = 0;
+const unsigned long countInterval = 10000; // 10 seconds
+int onlineCount = 0;
+bool countApiError = false;
+
 // Global display state
 String statusMessage = "Booting...";
-String lastWsMessage = "";
 std::vector<String> activeUsers;
 
 // ---------- Update Display UI ----------
@@ -72,12 +77,15 @@ void updateScreen() {
     display.println(statusMessage);
   }
 
-  // Footer (Incoming WS message)
-  if (lastWsMessage.length() > 0) {
-      display.drawLine(0, 52, 128, 52, SSD1306_WHITE);
-      display.setCursor(0, 54);
-      display.setTextSize(1);
-      display.println(lastWsMessage);
+  // Footer (Online Users Count)
+  display.drawLine(0, 52, 128, 52, SSD1306_WHITE);
+  display.setCursor(0, 54);
+  display.setTextSize(1);
+  if (countApiError) {
+    display.println("Online: API error");
+  } else {
+    display.print("Online: ");
+    display.println(onlineCount);
   }
 
   display.display();
@@ -218,12 +226,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                      }
                    }
                 }
-                lastWsMessage = displayName + " " + evt;
-              } else {
-                lastWsMessage = "Msg Recv";
               }
-            } else {
-              lastWsMessage = "Parse Error";
             }
             updateScreen();
             break;
@@ -364,6 +367,55 @@ void setup() {
   webSocket.setReconnectInterval(5000);
 }
 
+// ---------- Fetch Online Users Count ----------
+void fetchOnlineCount() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!countApiError) {
+      countApiError = true;
+      updateScreen();
+    }
+    return;
+  }
+
+  HTTPClient http;
+  String url = "http://" + String(serverAddress) + ":" + String(serverPort) + "/count";
+  
+  http.begin(url);
+  int httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    ESP_LOGI(TAG, "Count response: %s", payload.c_str());
+    
+    // Parse JSON response
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    
+    if (!error) {
+      int count = doc["count"];
+      if (onlineCount != count || countApiError) {
+        onlineCount = count;
+        countApiError = false;
+        updateScreen();
+      }
+    } else {
+      ESP_LOGW(TAG, "Failed to parse count JSON");
+      if (!countApiError) {
+        countApiError = true;
+        updateScreen();
+      }
+    }
+  } else {
+    ESP_LOGW(TAG, "Failed to fetch count, HTTP code: %d", httpCode);
+    if (!countApiError) {
+      countApiError = true;
+      updateScreen();
+    }
+  }
+  
+  http.end();
+}
+
 // ---------- Arduino loop ----------
 void loop() {
   webSocket.loop();
@@ -372,6 +424,18 @@ void loop() {
   if (millis() - lastUpdateCheck >= updateInterval) {
     lastUpdateCheck = millis();
     checkFirmwareUpdate(true);
+  }
+
+  // Poll online count periodically
+  if (millis() - lastCountCheck >= countInterval) {
+    lastCountCheck = millis();
+    fetchOnlineCount();
+  }
+
+  // Poll online count periodically
+  if (millis() - lastCountCheck >= countInterval) {
+    lastCountCheck = millis();
+    fetchOnlineCount();
   }
 
   // Read button state (active LOW)
