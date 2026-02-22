@@ -41,7 +41,7 @@ char userId[40] = "Guest"; // Mutable buffer for user ID
 Preferences preferences;   // For saving userId to NVS
 
 // -------- WebSocket server details --------
-const char serverAddress[] = "192.168.1.164";  // Your server IP / hostname
+const char serverAddress[] = "fitznet.doomdns.org";  // Your server IP / hostname
 const int  serverPort      = 8080;             // Your server port
 const char wsPath[]        = "/ws";            // WebSocket path
 
@@ -276,7 +276,7 @@ void checkFirmwareUpdate(bool silent) {
 
   WiFiClient client;
   
-  // Build URL: http://192.168.1.164:8080/api/firmware/latest
+  // Build URL: http://fitznet.doomdns.org:8080/api/firmware/latest
   String updateUrl = "http://" + String(serverAddress) + ":" + String(serverPort) + "/api/firmware/latest";
 
   // Register callback for progress bar
