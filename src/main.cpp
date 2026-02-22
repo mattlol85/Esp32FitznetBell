@@ -73,7 +73,8 @@ const unsigned long activityWindowMs = 650;
 
 // Update Scheduler
 unsigned long lastUpdateCheck = 0;
-const unsigned long updateInterval = 30000; // 30 seconds
+const unsigned long updateInterval = 60000; // 1 minute (prototype)
+const unsigned long ledFrameIntervalMs = 16; // ~60 FPS
 
 // Count Polling
 unsigned long lastCountCheck = 0;
@@ -623,6 +624,8 @@ void fetchOnlineCount() {
 
   HTTPClient http;
   String url = "http://" + String(serverAddress) + ":" + String(serverPort) + "/count";
+  http.setConnectTimeout(200);
+  http.setTimeout(250);
   
   http.begin(url);
   int httpCode = http.GET();
@@ -665,21 +668,24 @@ void loop() {
   webSocket.loop();
 
   unsigned long now = millis();
-  if (now - ledLastFrameMs >= 33) {
-    ledLastFrameMs = now;
-    ledPhase += 3;
+  while (now - ledLastFrameMs >= ledFrameIntervalMs) {
+    ledLastFrameMs += ledFrameIntervalMs;
+    ledPhase += 2;
     renderLedAnimation();
+    now = millis();
   }
 
   // Check for updates periodically
-  if (millis() - lastUpdateCheck >= updateInterval) {
-    lastUpdateCheck = millis();
-    checkFirmwareUpdate(true);
+  if (now - lastUpdateCheck >= updateInterval) {
+    if (!buttonPressed && now >= txActivityUntilMs && now >= rxActivityUntilMs) {
+      lastUpdateCheck = now;
+      checkFirmwareUpdate(true);
+    }
   }
 
   // Poll online count periodically
-  if (millis() - lastCountCheck >= countInterval) {
-    lastCountCheck = millis();
+  if (now - lastCountCheck >= countInterval) {
+    lastCountCheck = now;
     fetchOnlineCount();
   }
 
@@ -702,5 +708,5 @@ void loop() {
     updateLedState();
   }
 
-  delay(50);  
+  delay(1);
 }
