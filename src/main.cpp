@@ -12,7 +12,7 @@
 #include <HTTPUpdate.h>
 #include <FastLED.h>
 
-#define CURRENT_VERSION "v0.9.0"
+#define CURRENT_VERSION "v0.10.0"
 
 static const char* TAG = "FitzBell";
 
