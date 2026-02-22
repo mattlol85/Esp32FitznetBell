@@ -53,6 +53,7 @@ WebSocketsClient webSocket;
 
 // Track button state to prevent duplicate messages
 bool buttonPressed = false;
+bool wsConnected = false;
 
 // Update Scheduler
 unsigned long lastUpdateCheck = 0;
@@ -106,10 +107,30 @@ void updateScreen() {
   display.display();
 }
 
+void updateLedState() {
+  if (buttonPressed) {
+    setLedColor(CRGB::Red);
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    setLedColor(CRGB::Blue);
+    return;
+  }
+
+  if (!wsConnected) {
+    setLedColor(CRGB::Yellow);
+    return;
+  }
+
+  setLedColor(CRGB::Green);
+}
+
 // ---------- Helper: set status and update screen ----------
 void setStatus(String msg) {
   statusMessage = msg;
   updateScreen();
+  updateLedState();
 }
 
 // ---------- Helper: send JSON over WebSocket (button events) ----------
@@ -208,10 +229,12 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
         case WStype_DISCONNECTED:
             ESP_LOGW(TAG, "WS Disconnected");
+          wsConnected = false;
             setStatus("WS Disconnected");
             break;
         case WStype_CONNECTED:
             ESP_LOGI(TAG, "WS Connected");
+          wsConnected = true;
             setStatus("Ready");
             break;
         case WStype_TEXT:
@@ -386,6 +409,7 @@ void setup() {
   webSocket.begin(serverAddress, serverPort, wsPath);
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
+  updateLedState();
 }
 
 // ---------- Fetch Online Users Count ----------
@@ -453,12 +477,6 @@ void loop() {
     fetchOnlineCount();
   }
 
-  // Poll online count periodically
-  if (millis() - lastCountCheck >= countInterval) {
-    lastCountCheck = millis();
-    fetchOnlineCount();
-  }
-
   // Read button state (active LOW)
   int state = digitalRead(BUTTON_PIN);
 
@@ -468,12 +486,14 @@ void loop() {
     Serial.print("Button Pressed by ");
     Serial.println(userId);
     sendButtonEvent("PRESSED");
+    updateLedState();
   } else if (state == HIGH && buttonPressed) {
     // Transition: pressed -> released
     buttonPressed = false;
     Serial.print("Button Released by ");
     Serial.println(userId);
     sendButtonEvent("RELEASED");
+    updateLedState();
   }
 
   delay(50);  
