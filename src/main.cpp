@@ -18,7 +18,7 @@ static const char* TAG = "FitzBell";
 
 // -------- LED Strip --------
 #define LED_PIN     5
-#define NUM_LEDS    3
+#define NUM_LEDS    12
 #define BRIGHTNESS  64
 #define LED_TYPE    WS2812B
 #define COLOR_ORDER GRB
