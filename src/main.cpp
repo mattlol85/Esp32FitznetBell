@@ -30,6 +30,15 @@ void setLedColor(CRGB color) {
   FastLED.show();
 }
 
+int ringWrap(int index) {
+  while (index < 0) index += NUM_LEDS;
+  return index % NUM_LEDS;
+}
+
+uint8_t triWave8FromPhase(uint8_t phase) {
+  return (phase < 128) ? (phase * 2) : ((255 - phase) * 2);
+}
+
 // -------- OLED Display --------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -54,6 +63,13 @@ WebSocketsClient webSocket;
 // Track button state to prevent duplicate messages
 bool buttonPressed = false;
 bool wsConnected = false;
+bool updateInProgress = false;
+int updatePercent = -1;
+unsigned long ledLastFrameMs = 0;
+uint8_t ledPhase = 0;
+unsigned long txActivityUntilMs = 0;
+unsigned long rxActivityUntilMs = 0;
+const unsigned long activityWindowMs = 650;
 
 // Update Scheduler
 unsigned long lastUpdateCheck = 0;
@@ -68,6 +84,22 @@ bool countApiError = false;
 // Global display state
 String statusMessage = "Booting...";
 std::vector<String> activeUsers;
+
+enum class LedMode {
+  BOOTING,
+  WIFI_DOWN,
+  WS_DOWN,
+  UPDATING,
+  TX_ONLY,
+  RX_ONLY,
+  TX_RX,
+  BUTTON_HELD,
+  COUNT_ERROR,
+  ACTIVE_USERS,
+  READY
+};
+
+LedMode currentLedMode = LedMode::BOOTING;
 
 // ---------- Update Display UI ----------
 void updateScreen() {
@@ -107,23 +139,173 @@ void updateScreen() {
   display.display();
 }
 
+void markTxActivity() {
+  txActivityUntilMs = millis() + activityWindowMs;
+}
+
+void markRxActivity() {
+  rxActivityUntilMs = millis() + activityWindowMs;
+}
+
 void updateLedState() {
+  unsigned long now = millis();
+  bool txActive = now < txActivityUntilMs;
+  bool rxActive = now < rxActivityUntilMs;
+
+  if (updateInProgress) {
+    currentLedMode = LedMode::UPDATING;
+  } else if (txActive && rxActive) {
+    currentLedMode = LedMode::TX_RX;
+  } else if (txActive) {
+    currentLedMode = LedMode::TX_ONLY;
+  } else if (rxActive) {
+    currentLedMode = LedMode::RX_ONLY;
+  } else if (buttonPressed) {
+    currentLedMode = LedMode::BUTTON_HELD;
+  } else if (WiFi.status() != WL_CONNECTED) {
+    currentLedMode = LedMode::WIFI_DOWN;
+  } else if (!wsConnected) {
+    currentLedMode = LedMode::WS_DOWN;
+  } else if (countApiError) {
+    currentLedMode = LedMode::COUNT_ERROR;
+  } else if (!activeUsers.empty()) {
+    currentLedMode = LedMode::ACTIVE_USERS;
+  } else {
+    currentLedMode = LedMode::READY;
+  }
+}
+
+void renderLedAnimation() {
+  updateLedState();
+  fill_solid(leds, NUM_LEDS, CRGB::Black);
+
+  int usersTx = max(1, min((int)activeUsers.size(), NUM_LEDS));
   if (buttonPressed) {
-    setLedColor(CRGB::Red);
-    return;
+    usersTx = max(1, min(usersTx + 1, NUM_LEDS));
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    setLedColor(CRGB::Blue);
-    return;
+  switch (currentLedMode) {
+    case LedMode::BOOTING: {
+      for (int i = 0; i < NUM_LEDS; i++) {
+        uint8_t wave = triWave8FromPhase((uint8_t)(ledPhase + i * (255 / max(1, NUM_LEDS))));
+        leds[i] = CHSV(160, 220, scale8(wave, 140));
+      }
+      leds[ringWrap(ledPhase / 21)] += CRGB(40, 40, 70);
+      break;
+    }
+
+    case LedMode::WIFI_DOWN: {
+      uint8_t breath = triWave8FromPhase(ledPhase);
+      fill_solid(leds, NUM_LEDS, CHSV(160, 255, scale8(breath, 120)));
+      leds[ringWrap(ledPhase / 21)] += CRGB::White;
+      break;
+    }
+
+    case LedMode::WS_DOWN: {
+      fill_solid(leds, NUM_LEDS, CHSV(42, 255, 20));
+      int head = ringWrap(ledPhase / 18);
+      for (int trail = 0; trail < 4; trail++) {
+        int idx = ringWrap(head - trail);
+        uint8_t v = 170 - trail * 40;
+        leds[idx] = CHSV(42, 255, v);
+      }
+      break;
+    }
+
+    case LedMode::UPDATING: {
+      int lit = (updatePercent < 0) ? 0 : map(constrain(updatePercent, 0, 100), 0, 100, 0, NUM_LEDS);
+      for (int i = 0; i < NUM_LEDS; i++) {
+        leds[i] = (i < lit) ? CHSV(128, 220, 120) : CHSV(128, 220, 12);
+      }
+      int spinner = ringWrap(ledPhase / 16);
+      leds[spinner] = CRGB::White;
+      break;
+    }
+
+    case LedMode::TX_ONLY: {
+      fill_solid(leds, NUM_LEDS, CHSV(182, 210, 12));
+      int head = ringWrap(ledPhase / max(5, 22 - usersTx));
+      for (int trail = 0; trail < 5; trail++) {
+        int idx = ringWrap(head - trail);
+        uint8_t v = 200 - trail * 38;
+        leds[idx] += CHSV(182, 255, v);
+      }
+      leds[0] += CHSV(182, 40, 50);
+      break;
+    }
+
+    case LedMode::RX_ONLY: {
+      fill_solid(leds, NUM_LEDS, CHSV(145, 190, 10));
+      int head = ringWrap(NUM_LEDS - 1 - (ledPhase / max(5, 22 - usersTx)));
+      for (int trail = 0; trail < 5; trail++) {
+        int idx = ringWrap(head + trail);
+        uint8_t v = 200 - trail * 38;
+        leds[idx] += CHSV(128, 220, v);
+      }
+      leds[0] += CHSV(145, 40, 45);
+      break;
+    }
+
+    case LedMode::TX_RX: {
+      fill_solid(leds, NUM_LEDS, CHSV(170, 120, 8));
+      int speedDiv = max(5, 22 - usersTx);
+      int txHead = ringWrap(ledPhase / speedDiv);
+      int rxHead = ringWrap(NUM_LEDS - 1 - (ledPhase / speedDiv));
+
+      for (int trail = 0; trail < 4; trail++) {
+        uint8_t v = 210 - trail * 45;
+        leds[ringWrap(txHead - trail)] += CHSV(182, 255, v);
+        leds[ringWrap(rxHead + trail)] += CHSV(128, 255, v);
+      }
+
+      for (int i = 0; i < NUM_LEDS; i++) {
+        if (leds[i].r > 0 && leds[i].g > 0 && (i == txHead || i == rxHead)) {
+          leds[i] += CRGB(60, 60, 60);
+        }
+      }
+      leds[0] += CRGB(20, 20, 25);
+      break;
+    }
+
+    case LedMode::BUTTON_HELD: {
+      for (int i = 0; i < NUM_LEDS; i++) {
+        int d = min(i, NUM_LEDS - i);
+        uint8_t pulse = triWave8FromPhase((uint8_t)(ledPhase + d * 28));
+        leds[i] = CHSV(0, 255, scale8(pulse, 210));
+      }
+      int txHead = ringWrap(ledPhase / max(5, 22 - usersTx));
+      leds[txHead] += CHSV(182, 255, 110);
+      leds[0] += CRGB(90, 0, 0);
+      break;
+    }
+
+    case LedMode::COUNT_ERROR: {
+      bool on = (ledPhase % 64) < 32;
+      fill_solid(leds, NUM_LEDS, on ? CHSV(8, 255, 160) : CHSV(8, 255, 20));
+      leds[0] = on ? CRGB::White : CRGB(20, 20, 20);
+      break;
+    }
+
+    case LedMode::ACTIVE_USERS: {
+      fill_solid(leds, NUM_LEDS, CHSV(96, 255, 14));
+      int users = min((int)activeUsers.size(), NUM_LEDS);
+      for (int i = 0; i < users; i++) {
+        leds[i] = CHSV(96, 220, 140);
+      }
+      int marker = ringWrap(ledPhase / max(6, 24 - users));
+      leds[marker] += CHSV(140, 200, 70);
+      break;
+    }
+
+    case LedMode::READY: {
+      uint8_t breath = triWave8FromPhase(ledPhase);
+      fill_solid(leds, NUM_LEDS, CHSV(96, 240, 28 + scale8(breath, 45)));
+      leds[0] += CHSV(96, 80, 40);
+      break;
+    }
   }
 
-  if (!wsConnected) {
-    setLedColor(CRGB::Yellow);
-    return;
-  }
-
-  setLedColor(CRGB::Green);
+  FastLED.show();
 }
 
 // ---------- Helper: set status and update screen ----------
@@ -143,6 +325,7 @@ void sendButtonEvent(const char* eventType) {
 
   ESP_LOGI(TAG, "Sending: %s", json.c_str());
 
+  markTxActivity();
   webSocket.sendTXT(json);
 
   // Update local list immediately for responsiveness
@@ -239,6 +422,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             break;
         case WStype_TEXT:
             Serial.printf("Received: %s\n", payload);
+          markRxActivity();
             
             // Parse JSON
             JsonDocument doc;
@@ -273,6 +457,11 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 
 // ---------- Firmware Update Logic ----------
 void updateProgress(int cur, int total) {
+  updateInProgress = true;
+  if (total > 0) {
+    updatePercent = (cur * 100) / total;
+  }
+
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(0, 0);
@@ -294,6 +483,9 @@ void updateProgress(int cur, int total) {
 }
 
 void checkFirmwareUpdate(bool silent) {
+  updateInProgress = true;
+  updatePercent = 0;
+
   if (!silent) setStatus("Checking Update...");
   ESP_LOGI(TAG, "Checking for firmware updates...");
 
@@ -318,6 +510,8 @@ void checkFirmwareUpdate(bool silent) {
   switch (ret) {
     case HTTP_UPDATE_FAILED:
       ESP_LOGE(TAG, "Update failed: %s", httpUpdate.getLastErrorString().c_str());
+      updateInProgress = false;
+      updatePercent = -1;
       if (!silent) {
         setStatus("Update Failed");
         delay(2000);
@@ -329,6 +523,8 @@ void checkFirmwareUpdate(bool silent) {
 
     case HTTP_UPDATE_NO_UPDATES:
       ESP_LOGI(TAG, "No updates available");
+      updateInProgress = false;
+      updatePercent = -1;
       if (!silent) {
         setStatus("Up to Date");
         delay(1000);
@@ -337,6 +533,8 @@ void checkFirmwareUpdate(bool silent) {
 
     case HTTP_UPDATE_OK:
       ESP_LOGI(TAG, "Update installed");
+      updateInProgress = false;
+      updatePercent = 100;
       // Device will restart automatically
       break;
   }
@@ -358,6 +556,7 @@ void setup() {
   FastLED.setBrightness(BRIGHTNESS);
   // Startup color
   setLedColor(CRGB::Blue);
+  currentLedMode = LedMode::BOOTING;
 
   // I2C Scanner
   Wire.begin();
@@ -464,6 +663,13 @@ void fetchOnlineCount() {
 // ---------- Arduino loop ----------
 void loop() {
   webSocket.loop();
+
+  unsigned long now = millis();
+  if (now - ledLastFrameMs >= 33) {
+    ledLastFrameMs = now;
+    ledPhase += 3;
+    renderLedAnimation();
+  }
 
   // Check for updates periodically
   if (millis() - lastUpdateCheck >= updateInterval) {
