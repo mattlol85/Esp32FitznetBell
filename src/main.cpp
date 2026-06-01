@@ -1,3 +1,11 @@
+#ifndef ENABLE_DIAGNOSTICS
+#define ENABLE_DIAGNOSTICS 0
+#endif
+
+#if ENABLE_DIAGNOSTICS
+#define DEBUG_ESP_PORT Serial
+#endif
+
 #include <WiFi.h> 
 #include <WebSocketsClient.h>
 #include <Wire.h>
@@ -10,6 +18,7 @@
 #include "esp_log.h"
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
+#include <WiFiClientSecure.h>
 #include <FastLED.h>
 
 #define CURRENT_VERSION "v0.10.0"
@@ -50,9 +59,10 @@ char userId[40] = "Guest"; // Mutable buffer for user ID
 Preferences preferences;   // For saving userId to NVS
 
 // -------- WebSocket server details --------
-const char serverAddress[] = "fitznet.doomdns.org";  // Your server IP / hostname
-const int  serverPort      = 8080;             // Your server port
-const char wsPath[]        = "/ws";            // WebSocket path
+const char serverAddress[] = "gamerbell.fitznet.doomdns.org";  // Your server IP / hostname
+const int  serverPort      = 443;              // HTTPS/API port
+const int  wsPort          = 443;              // WSS port
+const char wsPath[]        = "/ws";           // WebSocket path
 
 // -------- Hardware pin for the button --------
 #define BUTTON_PIN 13   // GPIO pin for the button (to GND with INPUT_PULLUP)
@@ -79,16 +89,52 @@ const unsigned long ledFrameIntervalMs = 16; // ~60 FPS
 // Count Polling
 unsigned long lastCountCheck = 0;
 const unsigned long countInterval = 10000; // 10 seconds
+const unsigned long backendRetryDelayMs = 30000; // back off after backend failures
+unsigned long backendRetryAtMs = 0;
+const unsigned long wsDiagIntervalMs = 30000;
+unsigned long lastWsDiagMs = 0;
 int onlineCount = 0;
 bool countApiError = false;
+
+struct CountFetchResult {
+  bool wifiDown;
+  bool success;
+  bool parseError;
+  int httpCode;
+  int count;
+};
+
+enum class UpdateJobResult : uint8_t {
+  NONE,
+  FAILED,
+  NO_UPDATES,
+  OK
+};
+
+portMUX_TYPE networkMux = portMUX_INITIALIZER_UNLOCKED;
+TaskHandle_t networkTaskHandle = nullptr;
+
+volatile bool countJobPending = false;
+volatile bool countJobRunning = false;
+volatile bool countResultReady = false;
+CountFetchResult countResult = {false, false, false, -1, 0};
+
+volatile bool updateJobPending = false;
+volatile bool updateJobRunning = false;
+volatile bool updateRequestSilent = true;
+volatile bool updateResultReady = false;
+UpdateJobResult updateResult = UpdateJobResult::NONE;
+char updateErrorMsg[96] = {0};
 
 // Global display state
 String statusMessage = "Booting...";
 std::vector<String> activeUsers;
+String lastConnectionError = "";
 
 enum class LedMode {
   BOOTING,
   WIFI_DOWN,
+  BACKEND_DOWN,
   WS_DOWN,
   UPDATING,
   TX_ONLY,
@@ -101,6 +147,443 @@ enum class LedMode {
 };
 
 LedMode currentLedMode = LedMode::BOOTING;
+
+bool isBackendUnreachable() {
+  return WiFi.status() == WL_CONNECTED && !wsConnected && countApiError;
+}
+
+const char* wifiStatusToString(wl_status_t status) {
+  switch (status) {
+    case WL_NO_SHIELD: return "WL_NO_SHIELD";
+    case WL_IDLE_STATUS: return "WL_IDLE_STATUS";
+    case WL_NO_SSID_AVAIL: return "WL_NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED: return "WL_SCAN_COMPLETED";
+    case WL_CONNECTED: return "WL_CONNECTED";
+    case WL_CONNECT_FAILED: return "WL_CONNECT_FAILED";
+    case WL_CONNECTION_LOST: return "WL_CONNECTION_LOST";
+    case WL_DISCONNECTED: return "WL_DISCONNECTED";
+    default: return "WL_UNKNOWN";
+  }
+}
+
+void logDiagnostics(const char* context) {
+#if ENABLE_DIAGNOSTICS
+  String ip = WiFi.localIP().toString();
+  Serial.printf(
+    "[diag] %s | wifi=%s ip=%s rssi=%ld ws=%s countErr=%s count=%d retryAt=%lu uptime=%lu\n",
+    context,
+    wifiStatusToString(WiFi.status()),
+    ip.c_str(),
+    WiFi.RSSI(),
+    wsConnected ? "connected" : "disconnected",
+    countApiError ? "true" : "false",
+    onlineCount,
+    backendRetryAtMs,
+    millis()
+  );
+#else
+  (void)context;
+#endif
+}
+
+void logWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+#if ENABLE_DIAGNOSTICS
+  (void)info;
+  String ip = WiFi.localIP().toString();
+  Serial.printf(
+    "[wifi] event=%d status=%s ip=%s rssi=%ld\n",
+    (int)event,
+    wifiStatusToString(WiFi.status()),
+    ip.c_str(),
+    WiFi.RSSI()
+  );
+#else
+  (void)event;
+  (void)info;
+#endif
+}
+
+void logDomainResolution(const char* context) {
+#if ENABLE_DIAGNOSTICS
+  IPAddress resolvedIp;
+  bool resolved = WiFi.hostByName(serverAddress, resolvedIp);
+  Serial.printf(
+    "[dns] %s host=%s resolved=%s ip=%s apiPort=%d wsPath=%s\n",
+    context,
+    serverAddress,
+    resolved ? "true" : "false",
+    resolved ? resolvedIp.toString().c_str() : "n/a",
+    serverPort,
+    wsPath
+  );
+#else
+  (void)context;
+#endif
+}
+
+void logHttpRequest(const char* context, const String& url) {
+#if ENABLE_DIAGNOSTICS
+  Serial.printf(
+    "[http] %s url=%s host=%s apiPort=%d wsPath=%s wifi=%s ip=%s rssi=%ld\n",
+    context,
+    url.c_str(),
+    serverAddress,
+    serverPort,
+    wsPath,
+    wifiStatusToString(WiFi.status()),
+    WiFi.localIP().toString().c_str(),
+    WiFi.RSSI()
+  );
+#else
+  (void)context;
+  (void)url;
+#endif
+}
+
+void logWebSocketTarget() {
+#if ENABLE_DIAGNOSTICS
+  Serial.printf(
+    "[ws] target=wss://%s:%d%s\n",
+    serverAddress,
+    wsPort,
+    wsPath
+  );
+#endif
+}
+
+void runWebSocketHandshakeProbe(bool includePortInHostHeader, const char* originHeader) {
+#if ENABLE_DIAGNOSTICS
+  WiFiClientSecure probe;
+  probe.setInsecure();
+  probe.setTimeout(5000);
+
+  String hostHeader = String(serverAddress);
+  if (includePortInHostHeader) {
+    hostHeader += ":" + String(wsPort);
+  }
+
+  Serial.printf("[wsdiag] probe begin hostHeader=%s origin=%s\n",
+                hostHeader.c_str(),
+                originHeader ? originHeader : "<none>");
+
+  if (!probe.connect(serverAddress, wsPort)) {
+    Serial.printf("[wsdiag] probe connect failed host=%s port=%d\n", serverAddress, wsPort);
+    return;
+  }
+
+  String req = "GET " + String(wsPath) + " HTTP/1.1\r\n";
+  req += "Host: " + hostHeader + "\r\n";
+  req += "Connection: Upgrade\r\n";
+  req += "Upgrade: websocket\r\n";
+  req += "Sec-WebSocket-Version: 13\r\n";
+  req += "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+  if (originHeader && strlen(originHeader) > 0) {
+    req += "Origin: ";
+    req += originHeader;
+    req += "\r\n";
+  }
+  req += "User-Agent: FitzBell-wsdiag\r\n\r\n";
+
+  probe.print(req);
+
+  unsigned long deadline = millis() + 5000;
+  while (!probe.available() && millis() < deadline) {
+    delay(10);
+  }
+
+  if (!probe.available()) {
+    Serial.println("[wsdiag] probe timeout waiting for response");
+    probe.stop();
+    return;
+  }
+
+  String statusLine = probe.readStringUntil('\n');
+  statusLine.trim();
+  Serial.printf("[wsdiag] status %s\n", statusLine.c_str());
+
+  while (millis() < deadline && probe.connected()) {
+    String line = probe.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) {
+      Serial.println("[wsdiag] end headers");
+      break;
+    }
+    Serial.printf("[wsdiag] hdr %s\n", line.c_str());
+  }
+
+  if (probe.available()) {
+    String body = probe.readString();
+    body.trim();
+    if (body.length() > 0) {
+      Serial.printf("[wsdiag] body %s\n", body.c_str());
+    }
+  }
+
+  probe.stop();
+#else
+  (void)includePortInHostHeader;
+  (void)originHeader;
+#endif
+}
+
+void runWebSocketHandshakeDiagnostics(const char* reason, bool force = false) {
+#if ENABLE_DIAGNOSTICS
+  unsigned long now = millis();
+  if (!force && (now - lastWsDiagMs) < wsDiagIntervalMs) {
+    return;
+  }
+
+  lastWsDiagMs = now;
+  Serial.printf("[wsdiag] reason=%s\n", reason);
+  logDomainResolution("wsdiag");
+  runWebSocketHandshakeProbe(true, NULL);
+  runWebSocketHandshakeProbe(false, NULL);
+  runWebSocketHandshakeProbe(false, "file://");
+#else
+  (void)reason;
+  (void)force;
+#endif
+}
+
+void updateProgress(int cur, int total);
+void setStatus(String msg);
+void refreshConnectivityStatus();
+void markBackendRetryBackoff();
+void updateScreen();
+
+CountFetchResult doFetchOnlineCountBlocking() {
+  CountFetchResult result = {false, false, false, -1, 0};
+
+  if (WiFi.status() != WL_CONNECTED) {
+    result.wifiDown = true;
+    return result;
+  }
+
+  HTTPClient http;
+  WiFiClientSecure client;
+  client.setInsecure();
+  String url = "https://" + String(serverAddress) + "/count";
+  logHttpRequest("count-fetch", url);
+  http.setConnectTimeout(200);
+  http.setTimeout(250);
+
+  http.begin(client, url);
+  result.httpCode = http.GET();
+
+  if (result.httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    ESP_LOGI(TAG, "Count response: %s", payload.c_str());
+#if ENABLE_DIAGNOSTICS
+    Serial.printf("[count] url=%s payload=%s\n", url.c_str(), payload.c_str());
+#endif
+
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    if (!error) {
+      result.count = doc["count"] | 0;
+      result.success = true;
+    } else {
+      result.parseError = true;
+    }
+  } else {
+    ESP_LOGW(TAG, "Failed to fetch count, HTTP code: %d", result.httpCode);
+#if ENABLE_DIAGNOSTICS
+    Serial.printf("[count] url=%s httpCode=%d\n", url.c_str(), result.httpCode);
+#endif
+  }
+
+  http.end();
+  return result;
+}
+
+UpdateJobResult doFirmwareUpdateCheckBlocking() {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  String updateUrl = "https://" + String(serverAddress) + "/api/firmware/latest";
+  logHttpRequest("firmware-update", updateUrl);
+
+  httpUpdate.onProgress(updateProgress);
+  client.setTimeout(12000);
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  t_httpUpdate_return ret = httpUpdate.update(client, updateUrl, CURRENT_VERSION);
+  switch (ret) {
+    case HTTP_UPDATE_FAILED: {
+      String err = httpUpdate.getLastErrorString();
+      ESP_LOGE(TAG, "Update failed: %s", err.c_str());
+#if ENABLE_DIAGNOSTICS
+      Serial.printf("[update] url=%s error=%s\n", updateUrl.c_str(), err.c_str());
+#endif
+      portENTER_CRITICAL(&networkMux);
+      strncpy(updateErrorMsg, err.c_str(), sizeof(updateErrorMsg) - 1);
+      updateErrorMsg[sizeof(updateErrorMsg) - 1] = '\0';
+      portEXIT_CRITICAL(&networkMux);
+      return UpdateJobResult::FAILED;
+    }
+    case HTTP_UPDATE_NO_UPDATES:
+      ESP_LOGI(TAG, "No updates available");
+#if ENABLE_DIAGNOSTICS
+      Serial.printf("[update] url=%s result=no-updates\n", updateUrl.c_str());
+#endif
+      return UpdateJobResult::NO_UPDATES;
+    case HTTP_UPDATE_OK:
+      ESP_LOGI(TAG, "Update installed");
+#if ENABLE_DIAGNOSTICS
+      Serial.printf("[update] url=%s result=ok\n", updateUrl.c_str());
+#endif
+      return UpdateJobResult::OK;
+  }
+
+  return UpdateJobResult::FAILED;
+}
+
+void requestOnlineCountFetch() {
+  portENTER_CRITICAL(&networkMux);
+  bool busy = countJobPending || countJobRunning;
+  if (!busy) {
+    countJobPending = true;
+  }
+  portEXIT_CRITICAL(&networkMux);
+}
+
+void requestFirmwareUpdateCheck(bool silent) {
+  portENTER_CRITICAL(&networkMux);
+  bool busy = updateJobPending || updateJobRunning;
+  if (!busy) {
+    updateJobPending = true;
+    updateRequestSilent = silent;
+    updateInProgress = true;
+    updatePercent = 0;
+  }
+  portEXIT_CRITICAL(&networkMux);
+
+  if (!silent) {
+    setStatus("Checking Update...");
+  }
+  ESP_LOGI(TAG, "Checking for firmware updates...");
+  logDiagnostics("firmware-check-start");
+}
+
+void processNetworkResults() {
+  bool hasCountResult = false;
+  CountFetchResult localCountResult = {false, false, false, -1, 0};
+
+  bool hasUpdateResult = false;
+  UpdateJobResult localUpdateResult = UpdateJobResult::NONE;
+  bool localUpdateSilent = true;
+
+  portENTER_CRITICAL(&networkMux);
+  if (countResultReady) {
+    localCountResult = countResult;
+    countResultReady = false;
+    hasCountResult = true;
+  }
+
+  if (updateResultReady) {
+    localUpdateResult = updateResult;
+    updateResultReady = false;
+    localUpdateSilent = updateRequestSilent;
+    hasUpdateResult = true;
+  }
+  portEXIT_CRITICAL(&networkMux);
+
+  if (hasCountResult) {
+    if (localCountResult.wifiDown) {
+      if (!countApiError) {
+        countApiError = true;
+        refreshConnectivityStatus();
+      }
+      logDiagnostics("count-skip-no-wifi");
+    } else if (localCountResult.success) {
+      if (onlineCount != localCountResult.count || countApiError) {
+        onlineCount = localCountResult.count;
+        countApiError = false;
+        refreshConnectivityStatus();
+      }
+    } else {
+      if (localCountResult.parseError) {
+        ESP_LOGW(TAG, "Failed to parse count JSON");
+      }
+      if (!countApiError) {
+        countApiError = true;
+        refreshConnectivityStatus();
+      }
+      markBackendRetryBackoff();
+    }
+  }
+
+  if (hasUpdateResult) {
+    updateInProgress = false;
+
+    switch (localUpdateResult) {
+      case UpdateJobResult::FAILED:
+        updatePercent = -1;
+        if (!localUpdateSilent) {
+          setStatus("Update Failed");
+        } else {
+          updateScreen();
+        }
+        break;
+      case UpdateJobResult::NO_UPDATES:
+        updatePercent = -1;
+        if (!localUpdateSilent) {
+          setStatus("Up to Date");
+        }
+        break;
+      case UpdateJobResult::OK:
+        updatePercent = 100;
+        break;
+      case UpdateJobResult::NONE:
+        updatePercent = -1;
+        break;
+    }
+  }
+}
+
+void networkWorkerTask(void* parameter) {
+  (void)parameter;
+
+  while (true) {
+    bool runCount = false;
+    bool runUpdate = false;
+
+    portENTER_CRITICAL(&networkMux);
+    if (countJobPending && !countJobRunning) {
+      countJobPending = false;
+      countJobRunning = true;
+      runCount = true;
+    } else if (updateJobPending && !updateJobRunning) {
+      updateJobPending = false;
+      updateJobRunning = true;
+      runUpdate = true;
+    }
+    portEXIT_CRITICAL(&networkMux);
+
+    if (runCount) {
+      CountFetchResult result = doFetchOnlineCountBlocking();
+      portENTER_CRITICAL(&networkMux);
+      countResult = result;
+      countResultReady = true;
+      countJobRunning = false;
+      portEXIT_CRITICAL(&networkMux);
+      continue;
+    }
+
+    if (runUpdate) {
+      UpdateJobResult result = doFirmwareUpdateCheckBlocking();
+      portENTER_CRITICAL(&networkMux);
+      updateResult = result;
+      updateResultReady = true;
+      updateJobRunning = false;
+      portEXIT_CRITICAL(&networkMux);
+      continue;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+void fetchOnlineCount();
 
 // ---------- Update Display UI ----------
 void updateScreen() {
@@ -165,6 +648,8 @@ void updateLedState() {
     currentLedMode = LedMode::BUTTON_HELD;
   } else if (WiFi.status() != WL_CONNECTED) {
     currentLedMode = LedMode::WIFI_DOWN;
+  } else if (isBackendUnreachable()) {
+    currentLedMode = LedMode::BACKEND_DOWN;
   } else if (!wsConnected) {
     currentLedMode = LedMode::WS_DOWN;
   } else if (countApiError) {
@@ -199,6 +684,16 @@ void renderLedAnimation() {
       uint8_t breath = triWave8FromPhase(ledPhase);
       fill_solid(leds, NUM_LEDS, CHSV(160, 255, scale8(breath, 120)));
       leds[ringWrap(ledPhase / 21)] += CRGB::White;
+      break;
+    }
+
+    case LedMode::BACKEND_DOWN: {
+      bool pulse = (ledPhase % 96) < 48;
+      fill_solid(leds, NUM_LEDS, pulse ? CHSV(12, 255, 85) : CHSV(12, 255, 18));
+      int head = ringWrap(ledPhase / 14);
+      leds[head] += CRGB::White;
+      leds[ringWrap(head - 1)] += CHSV(18, 255, 80);
+      leds[ringWrap(head + 1)] += CHSV(8, 255, 60);
       break;
     }
 
@@ -316,6 +811,41 @@ void setStatus(String msg) {
   updateLedState();
 }
 
+void logConnectionError(const String& msg) {
+  if (lastConnectionError != msg) {
+    Serial.println("Connection error: " + msg);
+    lastConnectionError = msg;
+    logDiagnostics("connection-error");
+  }
+}
+
+void markBackendRetryBackoff() {
+  backendRetryAtMs = millis() + backendRetryDelayMs;
+}
+
+void refreshConnectivityStatus() {
+  if (WiFi.status() != WL_CONNECTED) {
+    logConnectionError("WiFi Disconnected");
+    setStatus("WiFi Disconnected");
+  } else if (isBackendUnreachable()) {
+    logConnectionError("Backend Unreachable");
+    setStatus("Backend Unreachable");
+  } else if (!wsConnected) {
+    logConnectionError("WS Disconnected");
+    setStatus("WS Disconnected");
+  } else if (countApiError) {
+    logConnectionError("API Unavailable");
+    setStatus("API Unavailable");
+  } else {
+    if (lastConnectionError.length() > 0) {
+      Serial.println("Connection restored");
+      lastConnectionError = "";
+    }
+    logDiagnostics("connection-restored");
+    setStatus("Ready");
+  }
+}
+
 // ---------- Helper: send JSON over WebSocket (button events) ----------
 void sendButtonEvent(const char* eventType) {
   // Build JSON string for ButtonEventDto
@@ -393,11 +923,13 @@ void connectToWiFi() {
   if(!res) {
     Serial.println("Failed to connect");
     setStatus("WiFi Failed");
+    logDiagnostics("wifi-manager-failed");
     // ESP.restart();
   } 
   else {
     // If you get here you have connected to the WiFi
     Serial.println("Connected to WiFi!");
+    logDiagnostics("wifi-manager-connected");
     setStatus("WiFi Connected");
     
     // Read updated parameter if it was just saved
@@ -412,17 +944,33 @@ void connectToWiFi() {
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
         case WStype_DISCONNECTED:
+          if (wsConnected) {
             ESP_LOGW(TAG, "WS Disconnected");
+          }
           wsConnected = false;
-            setStatus("WS Disconnected");
+          logDiagnostics("ws-disconnected");
+          runWebSocketHandshakeDiagnostics("event-disconnected");
+            refreshConnectivityStatus();
             break;
         case WStype_CONNECTED:
+          if (!wsConnected) {
             ESP_LOGI(TAG, "WS Connected");
+          }
           wsConnected = true;
-            setStatus("Ready");
+          logDiagnostics("ws-connected");
+            refreshConnectivityStatus();
+            break;
+        case WStype_ERROR:
+#if ENABLE_DIAGNOSTICS
+          Serial.printf("[ws] error len=%u payload=%s\n", (unsigned)length, (length > 0 && payload) ? (const char*)payload : "<none>");
+#endif
+            logDiagnostics("ws-error");
+          runWebSocketHandshakeDiagnostics("event-error");
             break;
         case WStype_TEXT:
+#if ENABLE_DIAGNOSTICS
             Serial.printf("Received: %s\n", payload);
+#endif
           markRxActivity();
             
             // Parse JSON
@@ -462,88 +1010,24 @@ void updateProgress(int cur, int total) {
   if (total > 0) {
     updatePercent = (cur * 100) / total;
   }
-
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("Firmware Update");
-  
-  display.setCursor(0, 20);
-  display.println("Downloading...");
-  
-  int percent = (cur * 100) / total;
-  display.setCursor(0, 35);
-  display.print(percent);
-  display.println("%");
-  
-  // Progress bar
-  display.drawRect(0, 50, 128, 10, SSD1306_WHITE);
-  display.fillRect(2, 52, map(percent, 0, 100, 0, 124), 6, SSD1306_WHITE);
-  
-  display.display();
 }
 
 void checkFirmwareUpdate(bool silent) {
-  updateInProgress = true;
-  updatePercent = 0;
-
-  if (!silent) setStatus("Checking Update...");
-  ESP_LOGI(TAG, "Checking for firmware updates...");
-
-  WiFiClient client;
-  
-  // Build URL: http://fitznet.doomdns.org:8080/api/firmware/latest
-  String updateUrl = "http://" + String(serverAddress) + ":" + String(serverPort) + "/api/firmware/latest";
-
-  // Register callback for progress bar
-  httpUpdate.onProgress(updateProgress);
-  
-  // Increase timeout for large files (default is often too short)
-  client.setTimeout(12000); 
-
-  // Check and update
-  // This sends 'x-ESP32-version: <CURRENT_VERSION>' header
-  // We also set followRedirects to true just in case
-  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  
-  t_httpUpdate_return ret = httpUpdate.update(client, updateUrl, CURRENT_VERSION);
-
-  switch (ret) {
-    case HTTP_UPDATE_FAILED:
-      ESP_LOGE(TAG, "Update failed: %s", httpUpdate.getLastErrorString().c_str());
-      updateInProgress = false;
-      updatePercent = -1;
-      if (!silent) {
-        setStatus("Update Failed");
-        delay(2000);
-      } else {
-        // Restore screen in case progress bar was shown
-        updateScreen();
-      }
-      break;
-
-    case HTTP_UPDATE_NO_UPDATES:
-      ESP_LOGI(TAG, "No updates available");
-      updateInProgress = false;
-      updatePercent = -1;
-      if (!silent) {
-        setStatus("Up to Date");
-        delay(1000);
-      }
-      break;
-
-    case HTTP_UPDATE_OK:
-      ESP_LOGI(TAG, "Update installed");
-      updateInProgress = false;
-      updatePercent = 100;
-      // Device will restart automatically
-      break;
-  }
+  requestFirmwareUpdateCheck(silent);
 }
 
 // ---------- Arduino setup ----------
 void setup() {
   Serial.begin(115200);
+#if ENABLE_DIAGNOSTICS
+  Serial.setDebugOutput(true);
+  esp_log_level_set("*", ESP_LOG_VERBOSE);
+  esp_log_level_set(TAG, ESP_LOG_VERBOSE);
+#else
+  Serial.setDebugOutput(false);
+  esp_log_level_set("*", ESP_LOG_WARN);
+  esp_log_level_set(TAG, ESP_LOG_INFO);
+#endif
   
   // Give the serial monitor a moment to hook up
   delay(1000); 
@@ -600,72 +1084,51 @@ void setup() {
   savedId.toCharArray(userId, 40);
   preferences.end();
 
+  logDomainResolution("boot");
+  logWebSocketTarget();
+
+#if ENABLE_DIAGNOSTICS
+  WiFi.onEvent(logWiFiEvent);
+#endif
+
   pinMode(BUTTON_PIN, INPUT_PULLUP);  // button to GND, internal pull-up
+
+  xTaskCreatePinnedToCore(
+    networkWorkerTask,
+    "networkWorker",
+    8192,
+    nullptr,
+    1,
+    &networkTaskHandle,
+    0
+  );
 
   connectToWiFi();
   checkFirmwareUpdate(false);
   
   // Init WebSocket
-  webSocket.begin(serverAddress, serverPort, wsPath);
+  webSocket.setExtraHeaders("");
+  webSocket.beginSSL(serverAddress, wsPort, wsPath, "", "");
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
+  webSocket.enableHeartbeat(15000, 3000, 2);
+  logDiagnostics("websocket-configured");
+  runWebSocketHandshakeDiagnostics("setup", true);
+
+  fetchOnlineCount();
+  refreshConnectivityStatus();
   updateLedState();
 }
 
 // ---------- Fetch Online Users Count ----------
 void fetchOnlineCount() {
-  if (WiFi.status() != WL_CONNECTED) {
-    if (!countApiError) {
-      countApiError = true;
-      updateScreen();
-    }
-    return;
-  }
-
-  HTTPClient http;
-  String url = "http://" + String(serverAddress) + ":" + String(serverPort) + "/count";
-  http.setConnectTimeout(200);
-  http.setTimeout(250);
-  
-  http.begin(url);
-  int httpCode = http.GET();
-  
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    ESP_LOGI(TAG, "Count response: %s", payload.c_str());
-    
-    // Parse JSON response
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, payload);
-    
-    if (!error) {
-      int count = doc["count"];
-      if (onlineCount != count || countApiError) {
-        onlineCount = count;
-        countApiError = false;
-        updateScreen();
-      }
-    } else {
-      ESP_LOGW(TAG, "Failed to parse count JSON");
-      if (!countApiError) {
-        countApiError = true;
-        updateScreen();
-      }
-    }
-  } else {
-    ESP_LOGW(TAG, "Failed to fetch count, HTTP code: %d", httpCode);
-    if (!countApiError) {
-      countApiError = true;
-      updateScreen();
-    }
-  }
-  
-  http.end();
+  requestOnlineCountFetch();
 }
 
 // ---------- Arduino loop ----------
 void loop() {
   webSocket.loop();
+  processNetworkResults();
 
   unsigned long now = millis();
   while (now - ledLastFrameMs >= ledFrameIntervalMs) {
@@ -676,7 +1139,7 @@ void loop() {
   }
 
   // Check for updates periodically
-  if (now - lastUpdateCheck >= updateInterval) {
+  if (now - lastUpdateCheck >= updateInterval && now >= backendRetryAtMs) {
     if (!buttonPressed && now >= txActivityUntilMs && now >= rxActivityUntilMs) {
       lastUpdateCheck = now;
       checkFirmwareUpdate(true);
@@ -684,7 +1147,7 @@ void loop() {
   }
 
   // Poll online count periodically
-  if (now - lastCountCheck >= countInterval) {
+  if (now - lastCountCheck >= countInterval && now >= backendRetryAtMs) {
     lastCountCheck = now;
     fetchOnlineCount();
   }
@@ -708,5 +1171,5 @@ void loop() {
     updateLedState();
   }
 
-  delay(1);
+  yield();
 }
