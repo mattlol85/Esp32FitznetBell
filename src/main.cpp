@@ -21,7 +21,7 @@
 #include <WiFiClientSecure.h>
 #include <FastLED.h>
 
-#define CURRENT_VERSION "v0.10.1"
+#define CURRENT_VERSION "v0.10.2"
 
 static const char* TAG = "FitzBell";
 
