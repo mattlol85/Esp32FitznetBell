@@ -77,9 +77,14 @@ bool updateInProgress = false;
 int updatePercent = -1;
 unsigned long ledLastFrameMs = 0;
 uint8_t ledPhase = 0;
+// OLED redraw is a ~20-80ms blocking I2C push; defer it out of the hot path
+// and throttle to ~20Hz so it never stalls the LED render loop.
+bool displayDirty = false;
+unsigned long lastDisplayFlushMs = 0;
+const unsigned long displayMinIntervalMs = 50;
 unsigned long txActivityUntilMs = 0;
 unsigned long rxActivityUntilMs = 0;
-const unsigned long activityWindowMs = 650;
+const unsigned long activityWindowMs = 300;
 
 // Update Scheduler
 unsigned long lastUpdateCheck = 0;
@@ -621,6 +626,15 @@ void updateScreen() {
   }
 
   display.display();
+  displayDirty = false;
+  lastDisplayFlushMs = millis();
+}
+
+// Defer an OLED redraw to the throttled flush in loop(); use this on the hot
+// path (button/WS events) instead of updateScreen() so the blocking I2C push
+// never freezes the LED animation.
+void requestScreenUpdate() {
+  displayDirty = true;
 }
 
 void markTxActivity() {
@@ -874,7 +888,7 @@ void sendButtonEvent(const char* eventType) {
     activeUsers.push_back(userId);
   }
 
-  updateScreen();
+  requestScreenUpdate();
 }
 
 // ---------- Helper: send a CONNECTED status (no buttonEvent field) ----------
@@ -999,7 +1013,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 }
               }
             }
-            updateScreen();
+            requestScreenUpdate();
             break;
     }
 }
@@ -1045,6 +1059,7 @@ void setup() {
 
   // I2C Scanner
   Wire.begin();
+  Wire.setClock(400000); // 400kHz: ~4x faster OLED pushes than the 100kHz default
   Serial.println("Scanning for I2C devices...");
   int nDevices = 0;
   for(byte address = 1; address < 127; address++ ) {
@@ -1135,6 +1150,13 @@ void loop() {
     ledLastFrameMs += ledFrameIntervalMs;
     ledPhase += 2;
     renderLedAnimation();
+    now = millis();
+  }
+
+  // Flush any pending OLED redraw, throttled so the blocking I2C push can't
+  // starve the LED frame loop above.
+  if (displayDirty && (now - lastDisplayFlushMs) >= displayMinIntervalMs) {
+    updateScreen();
     now = millis();
   }
 
