@@ -626,6 +626,17 @@ void updateScreen() {
     display.println(onlineCount);
   }
 
+  // Bottom-right firmware version label.
+  int16_t x1 = 0, y1 = 0;
+  uint16_t w = 0, h = 0;
+  display.getTextBounds(CURRENT_VERSION, 0, 54, &x1, &y1, &w, &h);
+  int16_t versionX = SCREEN_WIDTH - (int16_t)w;
+  if (versionX < 0) {
+    versionX = 0;
+  }
+  display.setCursor(versionX, 54);
+  display.print(CURRENT_VERSION);
+
   display.display();
   displayDirty = false;
   lastDisplayFlushMs = millis();
