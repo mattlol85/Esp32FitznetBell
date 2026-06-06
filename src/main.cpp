@@ -458,8 +458,9 @@ void requestFirmwareUpdateCheck(bool silent) {
   if (!busy) {
     updateJobPending = true;
     updateRequestSilent = silent;
-    updateInProgress = true;
-    updatePercent = 0;
+    // Only show update animation for user-visible checks.
+    updateInProgress = !silent;
+    updatePercent = silent ? -1 : 0;
   }
   portEXIT_CRITICAL(&networkMux);
 
