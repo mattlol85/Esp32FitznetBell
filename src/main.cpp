@@ -84,7 +84,7 @@ unsigned long lastDisplayFlushMs = 0;
 const unsigned long displayMinIntervalMs = 50;
 unsigned long txActivityUntilMs = 0;
 unsigned long rxActivityUntilMs = 0;
-const unsigned long activityWindowMs = 300;
+const unsigned long activityWindowMs = 120;
 
 // Update Scheduler
 unsigned long lastUpdateCheck = 0;
@@ -664,14 +664,14 @@ void updateLedState() {
 
   if (updateInProgress) {
     currentLedMode = LedMode::UPDATING;
+  } else if (buttonPressed) {
+    currentLedMode = LedMode::BUTTON_HELD;
   } else if (txActive && rxActive) {
     currentLedMode = LedMode::TX_RX;
   } else if (txActive) {
     currentLedMode = LedMode::TX_ONLY;
   } else if (rxActive) {
     currentLedMode = LedMode::RX_ONLY;
-  } else if (buttonPressed) {
-    currentLedMode = LedMode::BUTTON_HELD;
   } else if (WiFi.status() != WL_CONNECTED) {
     currentLedMode = LedMode::WIFI_DOWN;
   } else if (isBackendUnreachable()) {
@@ -1160,7 +1160,7 @@ void loop() {
   unsigned long now = millis();
   while (now - ledLastFrameMs >= ledFrameIntervalMs) {
     ledLastFrameMs += ledFrameIntervalMs;
-    ledPhase += 2;
+    ledPhase += 4;
     renderLedAnimation();
     now = millis();
   }
