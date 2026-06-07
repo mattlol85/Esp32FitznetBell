@@ -1161,6 +1161,59 @@ void setup() {
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);  // button to GND, internal pull-up
 
+  // Hold button at boot for 3s to wipe saved WiFi credentials and username.
+  // Release early to cancel and boot normally.
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    setLedColor(CRGB::Red);
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 10);
+    display.println("Hold 3s to reset");
+    display.setCursor(0, 22);
+    display.println("WiFi + Username");
+    display.setCursor(0, 40);
+    display.println("Release to cancel");
+    display.display();
+
+    unsigned long holdStart = millis();
+    bool confirmed = false;
+    while (digitalRead(BUTTON_PIN) == LOW) {
+      if (millis() - holdStart >= 3000) {
+        confirmed = true;
+        break;
+      }
+      delay(10);
+    }
+
+    if (confirmed) {
+      WiFiManager wm;
+      wm.resetSettings();
+
+      preferences.begin("app-config", false);
+      preferences.remove("userId");
+      preferences.end();
+      strcpy(userId, "Guest");
+
+      setLedColor(CRGB::Green);
+      display.clearDisplay();
+      display.setCursor(0, 20);
+      display.println("Settings cleared!");
+      display.setCursor(0, 35);
+      display.println("Starting setup...");
+      display.display();
+      delay(1500);
+    } else {
+      setLedColor(CRGB::Blue);
+      display.clearDisplay();
+      display.setCursor(10, 10);
+      display.println("Fitz-Net Bell");
+      display.setCursor(10, 30);
+      display.println("Initializing...");
+      display.display();
+    }
+  }
+
   xTaskCreatePinnedToCore(
     networkWorkerTask,
     "networkWorker",
