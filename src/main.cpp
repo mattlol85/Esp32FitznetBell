@@ -6,7 +6,7 @@
 #define DEBUG_ESP_PORT Serial
 #endif
 
-#include <WiFi.h> 
+#include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -20,6 +20,7 @@
 #include <HTTPUpdate.h>
 #include <WiFiClientSecure.h>
 #include <FastLED.h>
+#include "esp_wifi.h"
 
 #define CURRENT_VERSION "v0.12.0"
 
@@ -77,6 +78,9 @@ bool updateInProgress = false;
 int updatePercent = -1;
 unsigned long ledLastFrameMs = 0;
 uint8_t ledPhase = 0;
+uint8_t flashBrightness = 0;
+const uint8_t flashDecayPerFrame = 10;
+const uint8_t flashFloor = 28;
 // OLED redraw is a ~20-80ms blocking I2C push; defer it out of the hot path
 // and throttle to ~20Hz so it never stalls the LED render loop.
 bool displayDirty = false;
@@ -100,6 +104,11 @@ const unsigned long wsDiagIntervalMs = 30000;
 unsigned long lastWsDiagMs = 0;
 int onlineCount = 0;
 bool countApiError = false;
+
+// -------- Idle LED dim --------
+// After this many ms of READY-mode inactivity, fade LEDs to near-off.
+const unsigned long ledIdleTimeoutMs = 30000;
+unsigned long lastActivityMs = 0;
 
 struct CountFetchResult {
   bool wifiDown;
@@ -146,6 +155,7 @@ enum class LedMode {
   RX_ONLY,
   TX_RX,
   BUTTON_HELD,
+  BOTH_HELD,
   COUNT_ERROR,
   ACTIVE_USERS,
   READY
@@ -681,7 +691,7 @@ void updateLedState() {
   if (updateInProgress) {
     currentLedMode = LedMode::UPDATING;
   } else if (buttonPressed) {
-    currentLedMode = LedMode::BUTTON_HELD;
+    currentLedMode = (activeUsers.size() >= 2) ? LedMode::BOTH_HELD : LedMode::BUTTON_HELD;
   } else if (txActive && rxActive) {
     currentLedMode = LedMode::TX_RX;
   } else if (txActive) {
@@ -806,14 +816,26 @@ void renderLedAnimation() {
     }
 
     case LedMode::BUTTON_HELD: {
-      for (int i = 0; i < NUM_LEDS; i++) {
-        int d = min(i, NUM_LEDS - i);
-        uint8_t pulse = triWave8FromPhase((uint8_t)(ledPhase + d * 28));
-        leds[i] = CHSV(0, 255, scale8(pulse, 210));
+      // Camera-flash: instant white burst that decays to warm amber glow
+      if (flashBrightness > flashFloor) {
+        flashBrightness -= min((uint8_t)flashDecayPerFrame, (uint8_t)(flashBrightness - flashFloor));
       }
-      int txHead = ringWrap(ledPhase / max(5, 22 - usersTx));
-      leds[txHead] += CHSV(182, 255, 110);
-      leds[0] += CRGB(90, 0, 0);
+      // Saturation sweeps 0 (white) → 210 (amber) as brightness falls
+      uint8_t sat = (uint8_t)map(flashBrightness, flashFloor, 255, 210, 0);
+      fill_solid(leds, NUM_LEDS, CHSV(20, sat, flashBrightness));
+      break;
+    }
+
+    case LedMode::BOTH_HELD: {
+      // Two fast opposing comets — warm orange vs cool blue — on a dim gold base
+      fill_solid(leds, NUM_LEDS, CHSV(40, 255, 8));
+      int fwdHead = ringWrap(ledPhase / 5);
+      int revHead = ringWrap(NUM_LEDS - 1 - (ledPhase / 5));
+      for (int trail = 0; trail < 5; trail++) {
+        uint8_t v = 220 - trail * 40;
+        leds[ringWrap(fwdHead - trail)] += CHSV(20,  255, v);
+        leds[ringWrap(revHead + trail)] += CHSV(160, 255, v);
+      }
       break;
     }
 
@@ -836,9 +858,15 @@ void renderLedAnimation() {
     }
 
     case LedMode::READY: {
-      uint8_t breath = triWave8FromPhase(ledPhase);
-      fill_solid(leds, NUM_LEDS, CHSV(96, 240, 28 + scale8(breath, 45)));
-      leds[0] += CHSV(96, 80, 40);
+      unsigned long idleMs = millis() - lastActivityMs;
+      if (idleMs >= ledIdleTimeoutMs) {
+        // Dimmed to near-off after 30s idle — saves ~50–80mA on the LED ring.
+        fill_solid(leds, NUM_LEDS, CHSV(96, 240, 4));
+      } else {
+        uint8_t breath = triWave8FromPhase(ledPhase);
+        fill_solid(leds, NUM_LEDS, CHSV(96, 240, 28 + scale8(breath, 45)));
+        leds[0] += CHSV(96, 80, 40);
+      }
       break;
     }
   }
@@ -1014,6 +1042,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             Serial.printf("Received: %s\n", payload);
 #endif
           markRxActivity();
+          lastActivityMs = millis();
             
             // Parse JSON
             JsonDocument doc;
@@ -1071,8 +1100,11 @@ void setup() {
   esp_log_level_set(TAG, ESP_LOG_INFO);
 #endif
   
+  // 240→80 MHz saves ~60% CPU power; plenty for WS polling, JSON, OLED, LEDs.
+  setCpuFrequencyMhz(80);
+
   // Give the serial monitor a moment to hook up
-  delay(1000); 
+  delay(1000);
   Serial.println("\n\n=====================================");
   Serial.println("FitzBell Booting...");
   Serial.println("Firmware Version: " CURRENT_VERSION);
@@ -1147,6 +1179,9 @@ void setup() {
   );
 
   connectToWiFi();
+  // Modem sleep: radio powers down between DTIM beacon intervals (~100ms).
+  // WebSocket and HTTP continue to work; saves ~100–200mA during idle.
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
   checkFirmwareUpdate(false);
   
   // Init WebSocket
@@ -1208,6 +1243,8 @@ void loop() {
   if (state == LOW && !buttonPressed) {
     // Transition: not pressed -> pressed
     buttonPressed = true;
+    flashBrightness = 255;
+    lastActivityMs = millis();
     Serial.print("Button Pressed by ");
     Serial.println(userId);
     sendButtonEvent("PRESSED");
@@ -1215,6 +1252,8 @@ void loop() {
   } else if (state == HIGH && buttonPressed) {
     // Transition: pressed -> released
     buttonPressed = false;
+    flashBrightness = 0;
+    lastActivityMs = millis();
     Serial.print("Button Released by ");
     Serial.println(userId);
     sendButtonEvent("RELEASED");

@@ -80,7 +80,7 @@ Incoming messages accept either `userId` or `deviceId` as the display name. **Th
 
 ### OTA versioning
 
-The active firmware version is the `#define CURRENT_VERSION` string at the top of `src/main.cpp` (e.g., `"v0.11.1"`). `httpUpdate.update()` passes this as the `If-None-Match`-equivalent header to GamerBell, which only streams the binary when a newer release exists. The `release.yml` workflow rewrites this define automatically — **do not manually bump it** when using the release workflow.
+The active firmware version is the `#define CURRENT_VERSION` string at the top of `src/main.cpp` (e.g., `"v0.11.1"`). `httpUpdate.update()` passes this as the `If-None-Match`-equivalent header to GamerBell, which only streams the binary when a newer release exists. **CI owns this value — never bump `CURRENT_VERSION` manually.** The `release.yml` workflow computes the next semver, rewrites the define, commits it, and tags the release automatically.
 
 ### Diagnostics flag
 
@@ -161,6 +161,6 @@ Good subject tokens: `display`, `leds`, `ws`, `ota`, `wifi`, `ci`, `button`.
 - **Never call blocking HTTP/OTA from `loop()`** — always go through the job-queue pattern.
 - **Don't call `updateScreen()` from WebSocket events** — use `requestScreenUpdate()` to avoid stalling the LED frame loop.
 - **Don't commit `ENABLE_DIAGNOSTICS=1`** — it floods serial output and slightly changes timing.
-- **Don't manually bump `CURRENT_VERSION`** for a release — use `release.yml`; the workflow rewrites and commits it.
+- **Never touch `CURRENT_VERSION`** — CI rewrites and commits it via `release.yml`. Bumping it manually will conflict with the release workflow and may break OTA version comparison.
 - **WiFiManager resets** — `wm.resetSettings()` is intentionally commented out. Un-comment only for local testing; never commit it uncommented.
 - **TLS is `setInsecure()`** — no cert pinning by design for this personal platform. Don't add pinning without coordinating with GamerBell's certificate rotation.
