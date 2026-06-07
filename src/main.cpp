@@ -6,7 +6,7 @@
 #define DEBUG_ESP_PORT Serial
 #endif
 
-#include <WiFi.h> 
+#include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -20,6 +20,7 @@
 #include <HTTPUpdate.h>
 #include <WiFiClientSecure.h>
 #include <FastLED.h>
+#include "esp_wifi.h"
 
 #define CURRENT_VERSION "v0.12.0"
 
@@ -100,6 +101,11 @@ const unsigned long wsDiagIntervalMs = 30000;
 unsigned long lastWsDiagMs = 0;
 int onlineCount = 0;
 bool countApiError = false;
+
+// -------- Idle LED dim --------
+// After this many ms of READY-mode inactivity, fade LEDs to near-off.
+const unsigned long ledIdleTimeoutMs = 30000;
+unsigned long lastActivityMs = 0;
 
 struct CountFetchResult {
   bool wifiDown;
@@ -836,9 +842,15 @@ void renderLedAnimation() {
     }
 
     case LedMode::READY: {
-      uint8_t breath = triWave8FromPhase(ledPhase);
-      fill_solid(leds, NUM_LEDS, CHSV(96, 240, 28 + scale8(breath, 45)));
-      leds[0] += CHSV(96, 80, 40);
+      unsigned long idleMs = millis() - lastActivityMs;
+      if (idleMs >= ledIdleTimeoutMs) {
+        // Dimmed to near-off after 30s idle — saves ~50–80mA on the LED ring.
+        fill_solid(leds, NUM_LEDS, CHSV(96, 240, 4));
+      } else {
+        uint8_t breath = triWave8FromPhase(ledPhase);
+        fill_solid(leds, NUM_LEDS, CHSV(96, 240, 28 + scale8(breath, 45)));
+        leds[0] += CHSV(96, 80, 40);
+      }
       break;
     }
   }
@@ -1014,6 +1026,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             Serial.printf("Received: %s\n", payload);
 #endif
           markRxActivity();
+          lastActivityMs = millis();
             
             // Parse JSON
             JsonDocument doc;
@@ -1071,8 +1084,11 @@ void setup() {
   esp_log_level_set(TAG, ESP_LOG_INFO);
 #endif
   
+  // 240→80 MHz saves ~60% CPU power; plenty for WS polling, JSON, OLED, LEDs.
+  setCpuFrequencyMhz(80);
+
   // Give the serial monitor a moment to hook up
-  delay(1000); 
+  delay(1000);
   Serial.println("\n\n=====================================");
   Serial.println("FitzBell Booting...");
   Serial.println("Firmware Version: " CURRENT_VERSION);
@@ -1147,6 +1163,9 @@ void setup() {
   );
 
   connectToWiFi();
+  // Modem sleep: radio powers down between DTIM beacon intervals (~100ms).
+  // WebSocket and HTTP continue to work; saves ~100–200mA during idle.
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
   checkFirmwareUpdate(false);
   
   // Init WebSocket
@@ -1208,6 +1227,7 @@ void loop() {
   if (state == LOW && !buttonPressed) {
     // Transition: not pressed -> pressed
     buttonPressed = true;
+    lastActivityMs = millis();
     Serial.print("Button Pressed by ");
     Serial.println(userId);
     sendButtonEvent("PRESSED");
@@ -1215,6 +1235,7 @@ void loop() {
   } else if (state == HIGH && buttonPressed) {
     // Transition: pressed -> released
     buttonPressed = false;
+    lastActivityMs = millis();
     Serial.print("Button Released by ");
     Serial.println(userId);
     sendButtonEvent("RELEASED");
