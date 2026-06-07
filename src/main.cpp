@@ -79,6 +79,7 @@ int updatePercent = -1;
 unsigned long ledLastFrameMs = 0;
 uint8_t ledPhase = 0;
 uint8_t flashBrightness = 0;
+uint8_t rxFlashBrightness = 0;
 const uint8_t flashDecayPerFrame = 10;
 const uint8_t flashFloor = 28;
 // OLED redraw is a ~20-80ms blocking I2C push; defer it out of the hot path
@@ -783,14 +784,12 @@ void renderLedAnimation() {
     }
 
     case LedMode::RX_ONLY: {
-      fill_solid(leds, NUM_LEDS, CHSV(145, 190, 10));
-      int head = ringWrap(NUM_LEDS - 1 - (ledPhase / max(5, 22 - usersTx)));
-      for (int trail = 0; trail < 5; trail++) {
-        int idx = ringWrap(head + trail);
-        uint8_t v = 200 - trail * 38;
-        leds[idx] += CHSV(128, 220, v);
+      // Camera-flash on receive: white burst decaying to cool cyan
+      if (rxFlashBrightness > flashFloor) {
+        rxFlashBrightness -= min((uint8_t)flashDecayPerFrame, (uint8_t)(rxFlashBrightness - flashFloor));
       }
-      leds[0] += CHSV(145, 40, 45);
+      uint8_t rxSat = (uint8_t)map(rxFlashBrightness, flashFloor, 255, 210, 0);
+      fill_solid(leds, NUM_LEDS, CHSV(150, rxSat, rxFlashBrightness));
       break;
     }
 
@@ -858,15 +857,7 @@ void renderLedAnimation() {
     }
 
     case LedMode::READY: {
-      unsigned long idleMs = millis() - lastActivityMs;
-      if (idleMs >= ledIdleTimeoutMs) {
-        // Dimmed to near-off after 30s idle — saves ~50–80mA on the LED ring.
-        fill_solid(leds, NUM_LEDS, CHSV(96, 240, 4));
-      } else {
-        uint8_t breath = triWave8FromPhase(ledPhase);
-        fill_solid(leds, NUM_LEDS, CHSV(96, 240, 28 + scale8(breath, 45)));
-        leds[0] += CHSV(96, 80, 40);
-      }
+      // LEDs off at idle — screen is enough.
       break;
     }
   }
@@ -1060,6 +1051,8 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                    bool exists = false;
                    for(const auto& u : activeUsers) { if(u == displayName) exists = true; }
                    if(!exists) activeUsers.push_back(displayName);
+                   rxFlashBrightness = 255;
+                   rxActivityUntilMs = millis() + 500;
                 } else if (strcmp(evt, "RELEASED") == 0) {
                    for (int i = 0; i < activeUsers.size(); i++) {
                      if (activeUsers[i] == displayName) {
