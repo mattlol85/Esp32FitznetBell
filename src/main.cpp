@@ -606,9 +606,25 @@ void updateScreen() {
   display.setCursor(0, 20);
   
   if (activeUsers.size() > 0) {
-    display.setTextSize(2);
-    for (const auto& user : activeUsers) {
-      display.println(user);
+    display.setTextSize(1);
+    const int16_t colWidth  = SCREEN_WIDTH / 2;
+    const int16_t startY    = 20;
+    const int16_t rowHeight = 8;
+    const int     maxChars  = 10;
+
+    for (size_t i = 0; i < activeUsers.size(); i++) {
+      int16_t col = i % 2;
+      int16_t row = i / 2;
+      int16_t x   = col * colWidth;
+      int16_t y   = startY + row * rowHeight;
+      if (y + rowHeight > 52) break;
+
+      String name = activeUsers[i];
+      if ((int)name.length() > maxChars)
+        name = name.substring(0, maxChars);
+
+      display.setCursor(x, y);
+      display.print(name);
     }
   } else {
     display.setTextSize(1);
