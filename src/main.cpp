@@ -22,7 +22,7 @@
 #include <FastLED.h>
 #include "esp_wifi.h"
 
-#define CURRENT_VERSION "v0.14.1"
+#define CURRENT_VERSION "v0.15.0"
 
 static const char* TAG = "FitzBell";
 
