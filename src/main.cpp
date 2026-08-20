@@ -141,6 +141,45 @@ volatile bool updateResultReady = false;
 UpdateJobResult updateResult = UpdateJobResult::NONE;
 char updateErrorMsg[96] = {0};
 
+// Device error/log reporting: fire-and-forget POST to GamerBell's
+// /api/devices/log so failures are visible remotely, not just on Serial.
+struct DeviceLogJob {
+  char level[8];
+  char source[24];
+  char message[80];
+};
+
+volatile bool logJobPending = false;
+volatile bool logJobRunning = false;
+DeviceLogJob pendingLogJob = {"", "", ""};
+
+// Transition guards so a persistent failure logs once, not on every retry.
+// otaFailureLogSent is only touched from the core-0 network worker task
+// (doFirmwareUpdateCheckBlocking runs there exclusively, never concurrently
+// with itself), so it doesn't need the networkMux critical section.
+bool otaFailureLogSent = false;
+// wsErrorLogSent is only touched from webSocketEvent() on core 1.
+bool wsErrorLogSent = false;
+
+// Queues a device error/log report for the network worker to send.
+// Drops the report (rather than blocking or queuing) if a log send is
+// already pending/in-flight, so failing repeatedly can't back up the
+// network job queue behind the button/count/OTA jobs.
+void queueDeviceLog(const char* level, const char* source, const char* message) {
+  portENTER_CRITICAL(&networkMux);
+  bool busy = logJobPending || logJobRunning;
+  if (!busy) {
+    strncpy(pendingLogJob.level, level, sizeof(pendingLogJob.level) - 1);
+    pendingLogJob.level[sizeof(pendingLogJob.level) - 1] = '\0';
+    strncpy(pendingLogJob.source, source, sizeof(pendingLogJob.source) - 1);
+    pendingLogJob.source[sizeof(pendingLogJob.source) - 1] = '\0';
+    strncpy(pendingLogJob.message, message, sizeof(pendingLogJob.message) - 1);
+    pendingLogJob.message[sizeof(pendingLogJob.message) - 1] = '\0';
+    logJobPending = true;
+  }
+  portEXIT_CRITICAL(&networkMux);
+}
+
 // Global display state
 String statusMessage = "Booting...";
 std::vector<String> activeUsers;
@@ -435,6 +474,12 @@ UpdateJobResult doFirmwareUpdateCheckBlocking() {
       strncpy(updateErrorMsg, err.c_str(), sizeof(updateErrorMsg) - 1);
       updateErrorMsg[sizeof(updateErrorMsg) - 1] = '\0';
       portEXIT_CRITICAL(&networkMux);
+      if (!otaFailureLogSent) {
+        otaFailureLogSent = true;
+        char logMsg[80];
+        snprintf(logMsg, sizeof(logMsg), "OTA update failed: %s", err.c_str());
+        queueDeviceLog("ERROR", "ota", logMsg);
+      }
       return UpdateJobResult::FAILED;
     }
     case HTTP_UPDATE_NO_UPDATES:
@@ -442,6 +487,7 @@ UpdateJobResult doFirmwareUpdateCheckBlocking() {
 #if ENABLE_DIAGNOSTICS
       Serial.printf("[update] url=%s result=no-updates\n", updateUrl.c_str());
 #endif
+      otaFailureLogSent = false;
       return UpdateJobResult::NO_UPDATES;
     case HTTP_UPDATE_OK:
       ESP_LOGI(TAG, "Update installed");
@@ -452,6 +498,39 @@ UpdateJobResult doFirmwareUpdateCheckBlocking() {
   }
 
   return UpdateJobResult::FAILED;
+}
+
+void doSendDeviceLogBlocking(const DeviceLogJob& job) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  HTTPClient http;
+  WiFiClientSecure client;
+  client.setInsecure();
+  String url = "https://" + String(serverAddress) + "/api/devices/log";
+  logHttpRequest("device-log", url);
+
+  JsonDocument doc;
+  doc["deviceId"] = userId;
+  doc["firmwareVersion"] = CURRENT_VERSION;
+  doc["level"] = job.level;
+  doc["source"] = job.source;
+  doc["message"] = job.message;
+  String body;
+  serializeJson(doc, body);
+
+  http.setConnectTimeout(500);
+  http.setTimeout(500);
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  int httpCode = http.POST(body);
+#if ENABLE_DIAGNOSTICS
+  Serial.printf("[devicelog] url=%s httpCode=%d body=%s\n", url.c_str(), httpCode, body.c_str());
+#else
+  (void)httpCode;
+#endif
+  http.end();
 }
 
 void requestOnlineCountFetch() {
@@ -525,6 +604,13 @@ void processNetworkResults() {
       if (!countApiError) {
         countApiError = true;
         refreshConnectivityStatus();
+        char logMsg[80];
+        if (localCountResult.parseError) {
+          snprintf(logMsg, sizeof(logMsg), "count fetch: failed to parse JSON response");
+        } else {
+          snprintf(logMsg, sizeof(logMsg), "count fetch failed, HTTP code: %d", localCountResult.httpCode);
+        }
+        queueDeviceLog("ERROR", "count_fetch", logMsg);
       }
       markBackendRetryBackoff();
     }
@@ -564,6 +650,8 @@ void networkWorkerTask(void* parameter) {
   while (true) {
     bool runCount = false;
     bool runUpdate = false;
+    bool runLog = false;
+    DeviceLogJob localLogJob;
 
     portENTER_CRITICAL(&networkMux);
     if (countJobPending && !countJobRunning) {
@@ -574,6 +662,11 @@ void networkWorkerTask(void* parameter) {
       updateJobPending = false;
       updateJobRunning = true;
       runUpdate = true;
+    } else if (logJobPending && !logJobRunning) {
+      logJobPending = false;
+      logJobRunning = true;
+      localLogJob = pendingLogJob;
+      runLog = true;
     }
     portEXIT_CRITICAL(&networkMux);
 
@@ -593,6 +686,14 @@ void networkWorkerTask(void* parameter) {
       updateResult = result;
       updateResultReady = true;
       updateJobRunning = false;
+      portEXIT_CRITICAL(&networkMux);
+      continue;
+    }
+
+    if (runLog) {
+      doSendDeviceLogBlocking(localLogJob);
+      portENTER_CRITICAL(&networkMux);
+      logJobRunning = false;
       portEXIT_CRITICAL(&networkMux);
       continue;
     }
@@ -1007,6 +1108,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         case WStype_DISCONNECTED:
           if (wsConnected) {
             ESP_LOGW(TAG, "WS Disconnected");
+            queueDeviceLog("WARN", "websocket", "WebSocket disconnected");
           }
           wsConnected = false;
           logDiagnostics("ws-disconnected");
@@ -1018,6 +1120,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             ESP_LOGI(TAG, "WS Connected");
           }
           wsConnected = true;
+          wsErrorLogSent = false;
           logDiagnostics("ws-connected");
             refreshConnectivityStatus();
             break;
@@ -1027,6 +1130,10 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 #endif
             logDiagnostics("ws-error");
           runWebSocketHandshakeDiagnostics("event-error");
+          if (!wsErrorLogSent) {
+            wsErrorLogSent = true;
+            queueDeviceLog("ERROR", "websocket", "WebSocket transport error");
+          }
             break;
         case WStype_TEXT:
 #if ENABLE_DIAGNOSTICS

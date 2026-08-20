@@ -25,8 +25,9 @@ The firmware runs on an ESP32 DevKit and does five things:
 3. Polls `GET /count` every 10 s and shows how many devices are online.
 4. Checks `GET /api/firmware/latest` on boot and every 60 s; self-flashes over the air (OTA) when GamerBell serves a newer binary.
 5. Drives a 12-LED WS2812B ring with animated states for every connectivity and activity condition.
+6. Reports known failure points (count-fetch errors, WebSocket disconnects/errors, OTA failures) to GamerBell's `POST /api/devices/log` so they're visible in Loki/Grafana instead of only on the local Serial console.
 
-All networking (HTTP count fetch, OTA check) runs on a dedicated FreeRTOS task pinned to core 0 via `networkWorkerTask`. The UI, LED rendering, WebSocket loop, and button polling stay on core 1 in `loop()`.
+All networking (HTTP count fetch, OTA check, device error log POSTs) runs on a dedicated FreeRTOS task pinned to core 0 via `networkWorkerTask`. The UI, LED rendering, WebSocket loop, and button polling stay on core 1 in `loop()`.
 
 ---
 
@@ -62,6 +63,10 @@ HTTP and OTA calls block for up to several seconds and must not run on core 1. T
 3. `processNetworkResults()` (called every `loop()` iteration on core 1) reads the result under the same critical section and applies it to global state.
 
 When adding new background network calls, follow this same producer/consumer pattern. Never call `HTTPClient` or `HTTPUpdate` from `loop()` directly.
+
+### Device error logging (`queueDeviceLog`)
+
+`queueDeviceLog(level, source, message)` queues a fire-and-forget `POST /api/devices/log` to GamerBell, sent by `networkWorkerTask` via `doSendDeviceLogBlocking()`. Unlike the count/update jobs there's no result struct — nothing reads a response, since this is best-effort telemetry, not app state. If a log send is already pending/in-flight, `queueDeviceLog` silently drops the new one rather than queuing, so a repeatedly-failing condition can't back up the job queue behind button/count/OTA jobs. Call it at the point a failure *transitions* into existence (e.g. `if (!countApiError) { ... queueDeviceLog(...); }`), not on every retry, to avoid log spam.
 
 ### OLED throttling
 
