@@ -153,6 +153,14 @@ volatile bool logJobPending = false;
 volatile bool logJobRunning = false;
 DeviceLogJob pendingLogJob = {"", "", ""};
 
+// Transition guards so a persistent failure logs once, not on every retry.
+// otaFailureLogSent is only touched from the core-0 network worker task
+// (doFirmwareUpdateCheckBlocking runs there exclusively, never concurrently
+// with itself), so it doesn't need the networkMux critical section.
+bool otaFailureLogSent = false;
+// wsErrorLogSent is only touched from webSocketEvent() on core 1.
+bool wsErrorLogSent = false;
+
 // Queues a device error/log report for the network worker to send.
 // Drops the report (rather than blocking or queuing) if a log send is
 // already pending/in-flight, so failing repeatedly can't back up the
@@ -466,9 +474,12 @@ UpdateJobResult doFirmwareUpdateCheckBlocking() {
       strncpy(updateErrorMsg, err.c_str(), sizeof(updateErrorMsg) - 1);
       updateErrorMsg[sizeof(updateErrorMsg) - 1] = '\0';
       portEXIT_CRITICAL(&networkMux);
-      char logMsg[80];
-      snprintf(logMsg, sizeof(logMsg), "OTA update failed: %s", err.c_str());
-      queueDeviceLog("ERROR", "ota", logMsg);
+      if (!otaFailureLogSent) {
+        otaFailureLogSent = true;
+        char logMsg[80];
+        snprintf(logMsg, sizeof(logMsg), "OTA update failed: %s", err.c_str());
+        queueDeviceLog("ERROR", "ota", logMsg);
+      }
       return UpdateJobResult::FAILED;
     }
     case HTTP_UPDATE_NO_UPDATES:
@@ -476,6 +487,7 @@ UpdateJobResult doFirmwareUpdateCheckBlocking() {
 #if ENABLE_DIAGNOSTICS
       Serial.printf("[update] url=%s result=no-updates\n", updateUrl.c_str());
 #endif
+      otaFailureLogSent = false;
       return UpdateJobResult::NO_UPDATES;
     case HTTP_UPDATE_OK:
       ESP_LOGI(TAG, "Update installed");
@@ -1108,6 +1120,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             ESP_LOGI(TAG, "WS Connected");
           }
           wsConnected = true;
+          wsErrorLogSent = false;
           logDiagnostics("ws-connected");
             refreshConnectivityStatus();
             break;
@@ -1117,7 +1130,10 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 #endif
             logDiagnostics("ws-error");
           runWebSocketHandshakeDiagnostics("event-error");
-          queueDeviceLog("ERROR", "websocket", "WebSocket transport error");
+          if (!wsErrorLogSent) {
+            wsErrorLogSent = true;
+            queueDeviceLog("ERROR", "websocket", "WebSocket transport error");
+          }
             break;
         case WStype_TEXT:
 #if ENABLE_DIAGNOSTICS
