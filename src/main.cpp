@@ -1008,6 +1008,70 @@ void refreshConnectivityStatus() {
   }
 }
 
+// ---------- WiFi reconnect watchdog ----------
+// The ESP32 WiFi driver occasionally wedges after a drop (auth-expire /
+// beacon-loss, sometimes triggered by modem sleep) and never reconnects on
+// its own even with saved credentials and auto-reconnect enabled --
+// previously this required a manual power cycle. Force periodic reconnect
+// attempts while down, and hard-restart as a last resort if it stays down
+// too long.
+// 25s gives a slow-but-legitimate reconnect (weak signal, slow DHCP) time to
+// finish before we re-kick it; kicking too eagerly would restart the
+// handshake and could prevent it from ever completing.
+const unsigned long wifiReconnectRetryIntervalMs = 25000;
+const unsigned long wifiRestartAfterMs = 5UL * 60UL * 1000UL;
+bool wifiIsDown = false;
+unsigned long wifiDownSinceMs = 0;
+unsigned long lastWifiReconnectAttemptMs = 0;
+bool wifiConnectedPrev = true;
+
+void maintainWiFiConnection() {
+  unsigned long now = millis();
+  bool connected = (WiFi.status() == WL_CONNECTED);
+
+  if (connected != wifiConnectedPrev) {
+    wifiConnectedPrev = connected;
+    refreshConnectivityStatus();
+    if (connected && wifiIsDown) {
+      char logMsg[80];
+      snprintf(logMsg, sizeof(logMsg), "WiFi recovered after %lums down", now - wifiDownSinceMs);
+      queueDeviceLog("WARN", "wifi", logMsg);
+    }
+  }
+
+  if (connected) {
+    wifiIsDown = false;
+    return;
+  }
+
+  if (!wifiIsDown) {
+    wifiIsDown = true;
+    wifiDownSinceMs = now;
+    lastWifiReconnectAttemptMs = now;
+    return;
+  }
+
+  // An OTA in flight has its own connection/timeout handling in
+  // doFirmwareUpdateCheckBlocking(); forcing a reconnect or restart out from
+  // under it here would abort a download that might otherwise recover on
+  // its own once the radio comes back.
+  bool otaInFlight = updateJobRunning || updateJobPending;
+
+  if (!otaInFlight && now - lastWifiReconnectAttemptMs >= wifiReconnectRetryIntervalMs) {
+    lastWifiReconnectAttemptMs = now;
+    ESP_LOGW(TAG, "WiFi down %lums, forcing reconnect", now - wifiDownSinceMs);
+    logDiagnostics("wifi-forced-reconnect");
+    WiFi.reconnect();
+  }
+
+  if (!otaInFlight && now - wifiDownSinceMs >= wifiRestartAfterMs) {
+    ESP_LOGE(TAG, "WiFi down %lums, restarting", now - wifiDownSinceMs);
+    logDiagnostics("wifi-restart");
+    delay(100);
+    ESP.restart();
+  }
+}
+
 // ---------- Helper: send JSON over WebSocket (button events) ----------
 void sendButtonEvent(const char* eventType) {
   // Build JSON string for ButtonEventDto
@@ -1335,6 +1399,9 @@ void setup() {
   // Modem sleep: radio powers down between DTIM beacon intervals (~100ms).
   // WebSocket and HTTP continue to work; saves ~100–200mA during idle.
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  WiFi.persistent(true);
+  WiFi.setAutoReconnect(true);
+  wifiConnectedPrev = (WiFi.status() == WL_CONNECTED);
   checkFirmwareUpdate(false);
   
   // Init WebSocket
@@ -1358,6 +1425,7 @@ void fetchOnlineCount() {
 
 // ---------- Arduino loop ----------
 void loop() {
+  maintainWiFiConnection();
   webSocket.loop();
   processNetworkResults();
 
