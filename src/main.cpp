@@ -1008,6 +1008,59 @@ void refreshConnectivityStatus() {
   }
 }
 
+// ---------- WiFi reconnect watchdog ----------
+// The ESP32 WiFi driver occasionally wedges after a drop (auth-expire /
+// beacon-loss, sometimes triggered by modem sleep) and never reconnects on
+// its own even with saved credentials and auto-reconnect enabled --
+// previously this required a manual power cycle. Force periodic reconnect
+// attempts while down, and hard-restart as a last resort if it stays down
+// too long.
+const unsigned long wifiReconnectRetryIntervalMs = 15000;
+const unsigned long wifiRestartAfterMs = 5UL * 60UL * 1000UL;
+unsigned long wifiDownSinceMs = 0;
+unsigned long lastWifiReconnectAttemptMs = 0;
+bool wifiConnectedPrev = true;
+
+void maintainWiFiConnection() {
+  unsigned long now = millis();
+  bool connected = (WiFi.status() == WL_CONNECTED);
+
+  if (connected != wifiConnectedPrev) {
+    wifiConnectedPrev = connected;
+    refreshConnectivityStatus();
+    if (connected && wifiDownSinceMs != 0) {
+      char logMsg[80];
+      snprintf(logMsg, sizeof(logMsg), "WiFi recovered after %lums down", now - wifiDownSinceMs);
+      queueDeviceLog("WARN", "wifi", logMsg);
+    }
+  }
+
+  if (connected) {
+    wifiDownSinceMs = 0;
+    return;
+  }
+
+  if (wifiDownSinceMs == 0) {
+    wifiDownSinceMs = now;
+    lastWifiReconnectAttemptMs = now;
+    return;
+  }
+
+  if (now - lastWifiReconnectAttemptMs >= wifiReconnectRetryIntervalMs) {
+    lastWifiReconnectAttemptMs = now;
+    ESP_LOGW(TAG, "WiFi down %lums, forcing reconnect", now - wifiDownSinceMs);
+    logDiagnostics("wifi-forced-reconnect");
+    WiFi.reconnect();
+  }
+
+  if (now - wifiDownSinceMs >= wifiRestartAfterMs) {
+    ESP_LOGE(TAG, "WiFi down %lums, restarting", now - wifiDownSinceMs);
+    logDiagnostics("wifi-restart");
+    delay(100);
+    ESP.restart();
+  }
+}
+
 // ---------- Helper: send JSON over WebSocket (button events) ----------
 void sendButtonEvent(const char* eventType) {
   // Build JSON string for ButtonEventDto
@@ -1335,6 +1388,9 @@ void setup() {
   // Modem sleep: radio powers down between DTIM beacon intervals (~100ms).
   // WebSocket and HTTP continue to work; saves ~100–200mA during idle.
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  WiFi.persistent(true);
+  WiFi.setAutoReconnect(true);
+  wifiConnectedPrev = (WiFi.status() == WL_CONNECTED);
   checkFirmwareUpdate(false);
   
   // Init WebSocket
@@ -1358,6 +1414,7 @@ void fetchOnlineCount() {
 
 // ---------- Arduino loop ----------
 void loop() {
+  maintainWiFiConnection();
   webSocket.loop();
   processNetworkResults();
 
