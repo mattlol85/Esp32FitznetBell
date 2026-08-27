@@ -68,6 +68,20 @@ const char wsPath[]        = "/ws";           // WebSocket path
 // -------- Hardware pin for the button --------
 #define BUTTON_PIN 13   // GPIO pin for the button (to GND with INPUT_PULLUP)
 
+// -------- Battery meter (single-cell LiPo via ADC voltage divider) --------
+// Battery+ -> R1(100k) -> node -> R2(100k) -> GND ; node -> GPIO34.
+// GPIO34 is ADC1 + input-only, so it reads fine with WiFi active (ADC2 does not)
+// and doesn't collide with 5=LED / 13=button / 21-22=I2C.
+// Divider ratio = (R1 + R2) / R2 = 2.0; calibrate against a multimeter to absorb
+// resistor tolerance.
+#define BATTERY_ADC_PIN   34
+#define BATTERY_DIVIDER   2.0f
+#define BATTERY_SAMPLES   16
+const unsigned long batteryPollIntervalMs = 30000;
+unsigned long lastBatteryPollMs = 0;
+float batteryVolts = 0.0f;
+int batteryPercent = -1; // -1 until the first read completes
+
 // WebSocket client
 WebSocketsClient webSocket;
 
@@ -704,6 +718,35 @@ void networkWorkerTask(void* parameter) {
 void fetchOnlineCount();
 
 // ---------- Update Display UI ----------
+// Piecewise LiPo discharge curve: per-cell voltage -> % remaining. The real curve
+// is nonlinear (flat in the middle, steep at the ends), so a linear map reads poorly.
+int lipoPercentFromVolts(float v) {
+  static const float curveV[] = { 3.00f, 3.30f, 3.50f, 3.60f, 3.70f, 3.75f, 3.85f, 3.95f, 4.10f, 4.20f };
+  static const float curveP[] = { 0.0f,  5.0f,  10.0f, 20.0f, 40.0f, 55.0f, 70.0f, 85.0f, 95.0f, 100.0f };
+  const size_t n = sizeof(curveV) / sizeof(curveV[0]);
+  if (v <= curveV[0]) return 0;
+  if (v >= curveV[n - 1]) return 100;
+  for (size_t i = 1; i < n; i++) {
+    if (v < curveV[i]) {
+      float t = (v - curveV[i - 1]) / (curveV[i] - curveV[i - 1]);
+      return (int)lroundf(curveP[i - 1] + t * (curveP[i] - curveP[i - 1]));
+    }
+  }
+  return 100;
+}
+
+// Fast local ADC read (no network worker needed). Averages a handful of samples,
+// undoes the divider, and maps to a percentage via the LiPo curve.
+void pollBattery() {
+  uint32_t sumMv = 0;
+  for (int i = 0; i < BATTERY_SAMPLES; i++) {
+    sumMv += analogReadMilliVolts(BATTERY_ADC_PIN);
+  }
+  float nodeMv = (float)sumMv / BATTERY_SAMPLES;
+  batteryVolts = (nodeMv * BATTERY_DIVIDER) / 1000.0f;
+  batteryPercent = lipoPercentFromVolts(batteryVolts);
+}
+
 void updateScreen() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -712,6 +755,22 @@ void updateScreen() {
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.println("Fitz-Net Bell");
+
+  // Right-aligned battery percentage on the header line.
+  if (batteryPercent >= 0) {
+    char batt[8];
+    snprintf(batt, sizeof(batt), "%d%%", batteryPercent);
+    int16_t bx1 = 0, by1 = 0;
+    uint16_t bw = 0, bh = 0;
+    display.getTextBounds(batt, 0, 0, &bx1, &by1, &bw, &bh);
+    int16_t battX = SCREEN_WIDTH - (int16_t)bw;
+    if (battX < 0) {
+      battX = 0;
+    }
+    display.setCursor(battX, 0);
+    display.print(batt);
+  }
+
   display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
 
   // Main Body
@@ -1268,6 +1327,12 @@ void setup() {
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);  // button to GND, internal pull-up
 
+  // Battery ADC: 12-bit, 11dB attenuation (~0-3.1V range) covers the ~2.1V the
+  // divider produces at a full 4.2V cell. Prime an initial reading for the OLED.
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+  pollBattery();
+
   // Hold button at boot for 3s to wipe saved WiFi credentials and username.
   // Release early to cancel and boot normally.
   if (digitalRead(BUTTON_PIN) == LOW) {
@@ -1388,6 +1453,17 @@ void loop() {
   if (now - lastCountCheck >= countInterval && now >= backendRetryAtMs) {
     lastCountCheck = now;
     fetchOnlineCount();
+  }
+
+  // Sample the battery on a throttle. It's a fast local ADC read, so it stays on
+  // core 1 alongside the other periodic checks rather than the network worker.
+  if (now - lastBatteryPollMs >= batteryPollIntervalMs) {
+    lastBatteryPollMs = now;
+    int prevPercent = batteryPercent;
+    pollBattery();
+    if (batteryPercent != prevPercent) {
+      requestScreenUpdate();
+    }
   }
 
   // Read button state (active LOW)
