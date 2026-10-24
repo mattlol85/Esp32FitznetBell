@@ -149,6 +149,10 @@ The published `firmware.bin` is what GamerBell serves to devices via `GET /api/f
 
 ---
 
+## Custom Claude Code Agents
+
+- **`firmware-reviewer`** (`.claude/agents/firmware-reviewer.md`) — read-only reviewer for ESP32/PlatformIO firmware changes: WiFi/WebSocket resilience without power-cycling, OTA safety, error telemetry, memory/heap, ISR & FreeRTOS concurrency, NVS config. Run it after editing `src/main.cpp` and before opening a PR.
+
 ## Commit Convention
 
 ```
