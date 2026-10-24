@@ -1,0 +1,11 @@
+version: 2
+# PlatformIO is not a Dependabot ecosystem, so only Actions are covered here.
+# PlatformIO libraries and platform are pinned in platformio.ini and scanned by vulnScan / osv-scanner.
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]
