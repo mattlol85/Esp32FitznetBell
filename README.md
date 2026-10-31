@@ -121,6 +121,14 @@ To re-run setup, uncomment `wm.resetSettings();` in `connectToWiFi()` (or clear 
 4. If others connected to the same relay press their buttons, their names appear on your screen and contribute to the active-user animation.
 5. The footer shows the live **Online** device count; it reads "API error" if the count endpoint is unreachable.
 
+When the exact user name **Joe** is holding the button, the OLED shows
+**"Joe would like to game"** beside a small animated emergency beacon. This
+works for local and received button events. Releasing the button removes
+the message and beacon through the normal screen update flow; it does not
+latch or linger. The SSD1306 is monochrome, so the beacon is white, not red.
+While Joe is active, up to four other active names appear below the message.
+Other users retain the existing name display, and LED ring behavior is unchanged.
+
 ### LED ring states
 
 | State | Behavior |

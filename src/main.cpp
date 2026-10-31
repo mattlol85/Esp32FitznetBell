@@ -87,6 +87,10 @@ const uint8_t flashFloor = 28;
 bool displayDirty = false;
 unsigned long lastDisplayFlushMs = 0;
 const unsigned long displayMinIntervalMs = 50;
+const unsigned long beaconFrameIntervalMs = 150;
+unsigned long lastBeaconFrameMs = 0;
+uint8_t beaconFrame = 0;
+bool beaconAnimating = false;
 unsigned long txActivityUntilMs = 0;
 unsigned long rxActivityUntilMs = 0;
 const unsigned long activityWindowMs = 120;
@@ -704,6 +708,35 @@ void networkWorkerTask(void* parameter) {
 void fetchOnlineCount();
 
 // ---------- Update Display UI ----------
+bool isJoeActive() {
+  for (const auto& name : activeUsers) {
+    if (name == "Joe") return true;
+  }
+  return false;
+}
+
+// A 16x16 emergency beacon: fixed dome/base with a rotating light beam.
+// SSD1306 is monochrome, so all frames use white pixels.
+void drawGameBeacon(int16_t x, int16_t y) {
+  display.drawRoundRect(x + 4, y + 4, 8, 9, 3, SSD1306_WHITE);
+  display.fillRect(x + 2, y + 13, 12, 2, SSD1306_WHITE);
+  switch (beaconFrame) {
+    case 0:
+      display.drawLine(x, y + 5, x + 7, y + 8, SSD1306_WHITE);
+      break;
+    case 1:
+      display.drawLine(x + 7, y, x + 7, y + 8, SSD1306_WHITE);
+      break;
+    case 2:
+      display.drawLine(x + 7, y + 8, x + 15, y + 5, SSD1306_WHITE);
+      break;
+    case 3:
+      display.fillTriangle(x + 7, y + 7, x + 5, y + 11,
+                           x + 10, y + 11, SSD1306_WHITE);
+      break;
+  }
+}
+
 void updateScreen() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -720,13 +753,25 @@ void updateScreen() {
   if (activeUsers.size() > 0) {
     display.setTextSize(1);
     const int16_t colWidth  = SCREEN_WIDTH / 2;
-    const int16_t startY    = 20;
+    const bool joeActive = isJoeActive();
+    const int16_t startY    = joeActive ? 36 : 20;
     const int16_t rowHeight = 8;
     const int     maxChars  = 10;
 
+    if (joeActive) {
+      display.setCursor(0, 20);
+      display.print("Joe would like");
+      display.setCursor(0, 28);
+      display.print("to game");
+      drawGameBeacon(108, 19);
+    }
+
+    size_t visibleIndex = 0;
     for (size_t i = 0; i < activeUsers.size(); i++) {
-      int16_t col = i % 2;
-      int16_t row = i / 2;
+      if (joeActive && activeUsers[i] == "Joe") continue;
+      int16_t col = visibleIndex % 2;
+      int16_t row = visibleIndex / 2;
+      ++visibleIndex;
       int16_t x   = col * colWidth;
       int16_t y   = startY + row * rowHeight;
       if (y + rowHeight > 52) break;
@@ -775,6 +820,20 @@ void updateScreen() {
 // never freezes the LED animation.
 void requestScreenUpdate() {
   displayDirty = true;
+}
+
+void updateGameBeacon(unsigned long now) {
+  const bool active = isJoeActive();
+  if (active != beaconAnimating) {
+    beaconAnimating = active;
+    beaconFrame = 0;
+    lastBeaconFrameMs = now;
+    requestScreenUpdate();
+  } else if (active && now - lastBeaconFrameMs >= beaconFrameIntervalMs) {
+    beaconFrame = (beaconFrame + 1) % 4;
+    lastBeaconFrameMs = now;
+    requestScreenUpdate();
+  }
 }
 
 void markTxActivity() {
@@ -1371,6 +1430,7 @@ void loop() {
 
   // Flush any pending OLED redraw, throttled so the blocking I2C push can't
   // starve the LED frame loop above.
+  updateGameBeacon(now);
   if (displayDirty && (now - lastDisplayFlushMs) >= displayMinIntervalMs) {
     updateScreen();
     now = millis();
