@@ -57,11 +57,14 @@ Declared in `platformio.ini` and installed automatically:
 
 Wi-Fi credentials and the device user name are configured at runtime via the captive portal (see [First-Time Setup](#first-time-setup)) — they are **not** hardcoded.
 
-The relay endpoint is defined near the top of `src/main.cpp`. By default it points at the production GamerBell host over TLS:
+The relay endpoints are defined near the top of `src/main.cpp`. The device prefers the primary GamerBell host (behind Cloudflare) and keeps the direct origin hostname as a fallback while the migration is in progress:
 
 ```cpp
 // -------- WebSocket server details --------
-const char serverAddress[] = "gamerbell.fitznet.doomdns.org";  // GamerBell host
+const char* const serverHosts[] = {
+  "gamerbell.fitznet.org",          // primary (Cloudflare)
+  "gamerbell.fitznet.doomdns.org"   // fallback (direct to origin)
+};
 const int  serverPort      = 443;     // HTTPS/API port (used for /count and OTA)
 const int  wsPort          = 443;     // WSS port
 const char wsPath[]        = "/ws";   // WebSocket path
@@ -74,6 +77,8 @@ The device talks to three endpoints on this host:
 | `wss://<host>:443/ws` | WebSocket for button press/release events |
 | `https://<host>/count` | Online device count (polled every 10s) |
 | `https://<host>/api/firmware/latest` | OTA firmware image |
+
+**Failover:** after 2 consecutive failed `/count` polls the device switches every endpoint (WebSocket, count, OTA, device logs) to the next host and reports a `host_failover` log to GamerBell. While on the fallback it probes the primary's `/count` every 5 minutes and moves back as soon as it answers. The last host that answered is saved in NVS, so a reboot starts there. The boot-button settings reset also clears it.
 
 > TLS certificates are accepted with `setInsecure()` (no cert pinning), which is appropriate for this personal-platform setup.
 

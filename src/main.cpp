@@ -60,7 +60,28 @@ char userId[40] = "Guest"; // Mutable buffer for user ID
 Preferences preferences;   // For saving userId to NVS
 
 // -------- WebSocket server details --------
-const char serverAddress[] = "gamerbell.fitznet.doomdns.org";  // Your server IP / hostname
+// GamerBell answers on two hostnames while the origin moves behind Cloudflare.
+// The device prefers the primary, fails over to the fallback after repeated
+// backend failures, and probes the primary periodically so it moves back on
+// its own once that host is healthy. Drop the fallback once every bell has
+// migrated.
+const char* const serverHosts[] = {
+  "gamerbell.fitznet.org",          // primary (Cloudflare)
+  "gamerbell.fitznet.doomdns.org"   // fallback (direct to origin)
+};
+const uint8_t serverHostCount = sizeof(serverHosts) / sizeof(serverHosts[0]);
+const uint8_t primaryHostIndex = 0;
+// Written only on core 1 (switchServerHost). The network worker on core 0
+// reads it once per job, so a single-byte volatile is enough.
+volatile uint8_t activeHostIndex = primaryHostIndex;
+// Last host saved to NVS. Only a host that has answered gets saved, so an
+// outage that bounces between hosts doesn't keep rewriting flash.
+uint8_t savedHostIndex = primaryHostIndex;
+
+inline const char* activeServerAddress() {
+  return serverHosts[activeHostIndex];
+}
+
 const int  serverPort      = 443;              // HTTPS/API port
 const int  wsPort          = 443;              // WSS port
 const char wsPath[]        = "/ws";           // WebSocket path
@@ -68,8 +89,19 @@ const char wsPath[]        = "/ws";           // WebSocket path
 // -------- Hardware pin for the button --------
 #define BUTTON_PIN 13   // GPIO pin for the button (to GND with INPUT_PULLUP)
 
-// WebSocket client
-WebSocketsClient webSocket;
+// WebSocket client that can be pointed at a different host at runtime.
+// WebSocketsClient::disconnect() only frees a fully connected socket, and
+// begin() then drops the TCP/SSL pointer without deleting it, so re-targeting
+// mid-reconnect would leak. Free it explicitly before re-targeting.
+class RetargetableWebSocketsClient : public WebSocketsClient {
+ public:
+  void retargetSSL(const char* host, uint16_t port, const char* url) {
+    clientDisconnect(&_client, nullptr);
+    beginSSL(host, port, url, "", "");
+  }
+};
+
+RetargetableWebSocketsClient webSocket;
 
 // Track button state to prevent duplicate messages
 bool buttonPressed = false;
@@ -110,6 +142,12 @@ unsigned long lastWsDiagMs = 0;
 int onlineCount = 0;
 bool countApiError = false;
 
+// -------- Backend host failover (core 1 only) --------
+const uint8_t failoverThreshold = 2; // consecutive count-fetch failures
+uint8_t consecutiveBackendFailures = 0;
+const unsigned long primaryProbeIntervalMs = 300000; // 5 minutes
+unsigned long lastPrimaryProbeMs = 0;
+
 // -------- Idle LED dim --------
 // After this many ms of READY-mode inactivity, fade LEDs to near-off.
 const unsigned long ledIdleTimeoutMs = 30000;
@@ -121,6 +159,7 @@ struct CountFetchResult {
   bool parseError;
   int httpCode;
   int count;
+  uint8_t hostIndex;
 };
 
 enum class UpdateJobResult : uint8_t {
@@ -136,7 +175,12 @@ TaskHandle_t networkTaskHandle = nullptr;
 volatile bool countJobPending = false;
 volatile bool countJobRunning = false;
 volatile bool countResultReady = false;
-CountFetchResult countResult = {false, false, false, -1, 0};
+CountFetchResult countResult = {false, false, false, -1, 0, 0};
+
+volatile bool probeJobPending = false;
+volatile bool probeJobRunning = false;
+volatile bool probeResultReady = false;
+bool probeResult = false;
 
 volatile bool updateJobPending = false;
 volatile bool updateJobRunning = false;
@@ -265,11 +309,11 @@ void logWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 void logDomainResolution(const char* context) {
 #if ENABLE_DIAGNOSTICS
   IPAddress resolvedIp;
-  bool resolved = WiFi.hostByName(serverAddress, resolvedIp);
+  bool resolved = WiFi.hostByName(activeServerAddress(), resolvedIp);
   Serial.printf(
     "[dns] %s host=%s resolved=%s ip=%s apiPort=%d wsPath=%s\n",
     context,
-    serverAddress,
+    activeServerAddress(),
     resolved ? "true" : "false",
     resolved ? resolvedIp.toString().c_str() : "n/a",
     serverPort,
@@ -286,7 +330,7 @@ void logHttpRequest(const char* context, const String& url) {
     "[http] %s url=%s host=%s apiPort=%d wsPath=%s wifi=%s ip=%s rssi=%ld\n",
     context,
     url.c_str(),
-    serverAddress,
+    activeServerAddress(),
     serverPort,
     wsPath,
     wifiStatusToString(WiFi.status()),
@@ -303,7 +347,7 @@ void logWebSocketTarget() {
 #if ENABLE_DIAGNOSTICS
   Serial.printf(
     "[ws] target=wss://%s:%d%s\n",
-    serverAddress,
+    activeServerAddress(),
     wsPort,
     wsPath
   );
@@ -316,7 +360,7 @@ void runWebSocketHandshakeProbe(bool includePortInHostHeader, const char* origin
   probe.setInsecure();
   probe.setTimeout(5000);
 
-  String hostHeader = String(serverAddress);
+  String hostHeader = String(activeServerAddress());
   if (includePortInHostHeader) {
     hostHeader += ":" + String(wsPort);
   }
@@ -325,8 +369,8 @@ void runWebSocketHandshakeProbe(bool includePortInHostHeader, const char* origin
                 hostHeader.c_str(),
                 originHeader ? originHeader : "<none>");
 
-  if (!probe.connect(serverAddress, wsPort)) {
-    Serial.printf("[wsdiag] probe connect failed host=%s port=%d\n", serverAddress, wsPort);
+  if (!probe.connect(activeServerAddress(), wsPort)) {
+    Serial.printf("[wsdiag] probe connect failed host=%s port=%d\n", activeServerAddress(), wsPort);
     return;
   }
 
@@ -410,8 +454,8 @@ void refreshConnectivityStatus();
 void markBackendRetryBackoff();
 void updateScreen();
 
-CountFetchResult doFetchOnlineCountBlocking() {
-  CountFetchResult result = {false, false, false, -1, 0};
+CountFetchResult doFetchOnlineCountBlocking(uint8_t hostIndex) {
+  CountFetchResult result = {false, false, false, -1, 0, hostIndex};
 
   if (WiFi.status() != WL_CONNECTED) {
     result.wifiDown = true;
@@ -421,7 +465,7 @@ CountFetchResult doFetchOnlineCountBlocking() {
   HTTPClient http;
   WiFiClientSecure client;
   client.setInsecure();
-  String url = "https://" + String(serverAddress) + "/count";
+  String url = "https://" + String(serverHosts[hostIndex]) + "/count";
   logHttpRequest("count-fetch", url);
   http.setConnectTimeout(200);
   http.setTimeout(250);
@@ -459,7 +503,7 @@ UpdateJobResult doFirmwareUpdateCheckBlocking() {
   WiFiClientSecure client;
   client.setInsecure();
 
-  String updateUrl = "https://" + String(serverAddress) + "/api/firmware/latest";
+  String updateUrl = "https://" + String(activeServerAddress()) + "/api/firmware/latest";
   logHttpRequest("firmware-update", updateUrl);
 
   httpUpdate.onProgress(updateProgress);
@@ -512,7 +556,7 @@ void doSendDeviceLogBlocking(const DeviceLogJob& job) {
   HTTPClient http;
   WiFiClientSecure client;
   client.setInsecure();
-  String url = "https://" + String(serverAddress) + "/api/devices/log";
+  String url = "https://" + String(activeServerAddress()) + "/api/devices/log";
   logHttpRequest("device-log", url);
 
   JsonDocument doc;
@@ -546,6 +590,60 @@ void requestOnlineCountFetch() {
   portEXIT_CRITICAL(&networkMux);
 }
 
+// Asks the network worker to check whether the primary host answers /count.
+// Only used while running on a fallback host.
+void requestPrimaryProbe() {
+  portENTER_CRITICAL(&networkMux);
+  bool busy = probeJobPending || probeJobRunning;
+  if (!busy) {
+    probeJobPending = true;
+  }
+  portEXIT_CRITICAL(&networkMux);
+}
+
+void saveActiveHostIfChanged() {
+  if (savedHostIndex == activeHostIndex) {
+    return;
+  }
+  savedHostIndex = activeHostIndex;
+  preferences.begin("app-config", false);
+  preferences.putUChar("hostIndex", savedHostIndex);
+  preferences.end();
+}
+
+// Points every backend call (WebSocket, count, OTA, device logs) at another
+// host. Core 1 only.
+void switchServerHost(uint8_t index, const char* reason) {
+  if (index == activeHostIndex || index >= serverHostCount) {
+    return;
+  }
+
+  ESP_LOGW(TAG, "Backend host %s: %s -> %s", reason, serverHosts[activeHostIndex], serverHosts[index]);
+  activeHostIndex = index;
+  consecutiveBackendFailures = 0;
+  lastPrimaryProbeMs = millis();
+
+  // Queue before re-targeting so this log wins over the WebSocket
+  // disconnect log (only one log job is held at a time).
+  char logMsg[80];
+  snprintf(logMsg, sizeof(logMsg), "%s: now using %s", reason, serverHosts[index]);
+  queueDeviceLog("WARN", "host_failover", logMsg);
+
+  webSocket.retargetSSL(activeServerAddress(), wsPort, wsPath);
+  logWebSocketTarget();
+
+  // Poll the new host right away instead of waiting out the backoff.
+  backendRetryAtMs = 0;
+  lastCountCheck = millis() - countInterval;
+}
+
+void recordBackendFailure() {
+  if (++consecutiveBackendFailures < failoverThreshold) {
+    return;
+  }
+  switchServerHost((activeHostIndex + 1) % serverHostCount, "failover");
+}
+
 void requestFirmwareUpdateCheck(bool silent) {
   portENTER_CRITICAL(&networkMux);
   bool busy = updateJobPending || updateJobRunning;
@@ -567,7 +665,10 @@ void requestFirmwareUpdateCheck(bool silent) {
 
 void processNetworkResults() {
   bool hasCountResult = false;
-  CountFetchResult localCountResult = {false, false, false, -1, 0};
+  CountFetchResult localCountResult = {false, false, false, -1, 0, 0};
+
+  bool hasProbeResult = false;
+  bool localProbeResult = false;
 
   bool hasUpdateResult = false;
   UpdateJobResult localUpdateResult = UpdateJobResult::NONE;
@@ -586,7 +687,21 @@ void processNetworkResults() {
     localUpdateSilent = updateRequestSilent;
     hasUpdateResult = true;
   }
+
+  if (probeResultReady) {
+    localProbeResult = probeResult;
+    probeResultReady = false;
+    hasProbeResult = true;
+  }
   portEXIT_CRITICAL(&networkMux);
+
+  if (hasProbeResult && localProbeResult) {
+    switchServerHost(primaryHostIndex, "recovered");
+  }
+
+  // A result from a host we've since switched away from says nothing about
+  // the current one.
+  bool countResultIsCurrent = localCountResult.hostIndex == activeHostIndex;
 
   if (hasCountResult) {
     if (localCountResult.wifiDown) {
@@ -596,6 +711,10 @@ void processNetworkResults() {
       }
       logDiagnostics("count-skip-no-wifi");
     } else if (localCountResult.success) {
+      if (countResultIsCurrent) {
+        consecutiveBackendFailures = 0;
+        saveActiveHostIfChanged();
+      }
       if (onlineCount != localCountResult.count || countApiError) {
         onlineCount = localCountResult.count;
         countApiError = false;
@@ -617,6 +736,9 @@ void processNetworkResults() {
         queueDeviceLog("ERROR", "count_fetch", logMsg);
       }
       markBackendRetryBackoff();
+      if (countResultIsCurrent) {
+        recordBackendFailure();
+      }
     }
   }
 
@@ -655,6 +777,7 @@ void networkWorkerTask(void* parameter) {
     bool runCount = false;
     bool runUpdate = false;
     bool runLog = false;
+    bool runProbe = false;
     DeviceLogJob localLogJob;
 
     portENTER_CRITICAL(&networkMux);
@@ -671,11 +794,15 @@ void networkWorkerTask(void* parameter) {
       logJobRunning = true;
       localLogJob = pendingLogJob;
       runLog = true;
+    } else if (probeJobPending && !probeJobRunning) {
+      probeJobPending = false;
+      probeJobRunning = true;
+      runProbe = true;
     }
     portEXIT_CRITICAL(&networkMux);
 
     if (runCount) {
-      CountFetchResult result = doFetchOnlineCountBlocking();
+      CountFetchResult result = doFetchOnlineCountBlocking(activeHostIndex);
       portENTER_CRITICAL(&networkMux);
       countResult = result;
       countResultReady = true;
@@ -698,6 +825,16 @@ void networkWorkerTask(void* parameter) {
       doSendDeviceLogBlocking(localLogJob);
       portENTER_CRITICAL(&networkMux);
       logJobRunning = false;
+      portEXIT_CRITICAL(&networkMux);
+      continue;
+    }
+
+    if (runProbe) {
+      bool healthy = doFetchOnlineCountBlocking(primaryHostIndex).success;
+      portENTER_CRITICAL(&networkMux);
+      probeResult = healthy;
+      probeResultReady = true;
+      probeJobRunning = false;
       portEXIT_CRITICAL(&networkMux);
       continue;
     }
@@ -1316,6 +1453,11 @@ void setup() {
   preferences.begin("app-config", true); // Read-only mode
   String savedId = preferences.getString("userId", "Guest");
   savedId.toCharArray(userId, 40);
+  // Start on the last host that worked so a reboot during the migration
+  // doesn't sit through a failover before reaching the backend.
+  uint8_t savedHost = preferences.getUChar("hostIndex", primaryHostIndex);
+  activeHostIndex = savedHost < serverHostCount ? savedHost : primaryHostIndex;
+  savedHostIndex = activeHostIndex;
   preferences.end();
 
   logDomainResolution("boot");
@@ -1358,8 +1500,11 @@ void setup() {
 
       preferences.begin("app-config", false);
       preferences.remove("userId");
+      preferences.remove("hostIndex");
       preferences.end();
       strcpy(userId, "Guest");
+      activeHostIndex = primaryHostIndex;
+      savedHostIndex = primaryHostIndex;
 
       setLedColor(CRGB::Green);
       display.clearDisplay();
@@ -1398,7 +1543,7 @@ void setup() {
   
   // Init WebSocket
   webSocket.setExtraHeaders("");
-  webSocket.beginSSL(serverAddress, wsPort, wsPath, "", "");
+  webSocket.beginSSL(activeServerAddress(), wsPort, wsPath, "", "");
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
   webSocket.enableHeartbeat(15000, 3000, 2);
@@ -1448,6 +1593,12 @@ void loop() {
   if (now - lastCountCheck >= countInterval && now >= backendRetryAtMs) {
     lastCountCheck = now;
     fetchOnlineCount();
+  }
+
+  // While on a fallback host, keep checking whether the primary is back.
+  if (activeHostIndex != primaryHostIndex && now - lastPrimaryProbeMs >= primaryProbeIntervalMs) {
+    lastPrimaryProbeMs = now;
+    requestPrimaryProbe();
   }
 
   // Read button state (active LOW)
