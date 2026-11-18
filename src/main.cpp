@@ -59,8 +59,27 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 char userId[40] = "Guest"; // Mutable buffer for user ID
 Preferences preferences;   // For saving userId to NVS
 
-// -------- WebSocket server details --------
-const char serverAddress[] = "gamerbell.fitznet.doomdns.org";  // Your server IP / hostname
+// -------- Server hosts (WebSocket + HTTP API + OTA) --------
+// Tried in order. The bell sticks to whichever host it last connected to (saved
+// in NVS) and only moves to the next one after wsFailoverAfterMs without a
+// WebSocket connection while WiFi is up, so a host going away (e.g. the legacy
+// doomdns path being shut down) heals itself instead of stranding the device.
+const char* const serverHosts[] = {
+  "gamerbell.fitznet.org",          // Cloudflare Tunnel (preferred)
+  "gamerbell.fitznet.doomdns.org",  // Legacy direct path via router port-forward
+};
+const uint8_t serverHostCount = sizeof(serverHosts) / sizeof(serverHosts[0]);
+// Read by the network worker task while loop() may change it. A single byte is
+// read/written atomically; each request uses whichever host was active when it
+// started.
+volatile uint8_t activeHostIdx = 0;
+inline const char* activeHost() { return serverHosts[activeHostIdx]; }
+
+const unsigned long wsFailoverAfterMs = 30000; // ~6 reconnect attempts at 5 s
+unsigned long wsLastConnectedOrSwitchMs = 0;
+uint8_t savedHostIdx = 0;            // value in NVS, to avoid needless flash writes
+bool wsConnectedSinceSwitch = false; // log the host once per boot/switch
+
 const int  serverPort      = 443;              // HTTPS/API port
 const int  wsPort          = 443;              // WSS port
 const char wsPath[]        = "/ws";           // WebSocket path
@@ -68,8 +87,12 @@ const char wsPath[]        = "/ws";           // WebSocket path
 // -------- Hardware pin for the button --------
 #define BUTTON_PIN 13   // GPIO pin for the button (to GND with INPUT_PULLUP)
 
-// WebSocket client
-WebSocketsClient webSocket;
+// One WebSocket client per host, configured once in setup(); only the active
+// one is loop()ed. Re-calling beginSSL() on a single client to change host
+// leaks its previous TLS client when it isn't connected, which would exhaust
+// the heap if the bell kept failing over while both hosts were down.
+WebSocketsClient wsClients[serverHostCount];
+inline WebSocketsClient& activeWs() { return wsClients[activeHostIdx]; }
 
 // Track button state to prevent duplicate messages
 bool buttonPressed = false;
@@ -265,11 +288,11 @@ void logWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 void logDomainResolution(const char* context) {
 #if ENABLE_DIAGNOSTICS
   IPAddress resolvedIp;
-  bool resolved = WiFi.hostByName(serverAddress, resolvedIp);
+  bool resolved = WiFi.hostByName(activeHost(), resolvedIp);
   Serial.printf(
     "[dns] %s host=%s resolved=%s ip=%s apiPort=%d wsPath=%s\n",
     context,
-    serverAddress,
+    activeHost(),
     resolved ? "true" : "false",
     resolved ? resolvedIp.toString().c_str() : "n/a",
     serverPort,
@@ -286,7 +309,7 @@ void logHttpRequest(const char* context, const String& url) {
     "[http] %s url=%s host=%s apiPort=%d wsPath=%s wifi=%s ip=%s rssi=%ld\n",
     context,
     url.c_str(),
-    serverAddress,
+    activeHost(),
     serverPort,
     wsPath,
     wifiStatusToString(WiFi.status()),
@@ -303,7 +326,7 @@ void logWebSocketTarget() {
 #if ENABLE_DIAGNOSTICS
   Serial.printf(
     "[ws] target=wss://%s:%d%s\n",
-    serverAddress,
+    activeHost(),
     wsPort,
     wsPath
   );
@@ -316,7 +339,7 @@ void runWebSocketHandshakeProbe(bool includePortInHostHeader, const char* origin
   probe.setInsecure();
   probe.setTimeout(5000);
 
-  String hostHeader = String(serverAddress);
+  String hostHeader = String(activeHost());
   if (includePortInHostHeader) {
     hostHeader += ":" + String(wsPort);
   }
@@ -325,8 +348,8 @@ void runWebSocketHandshakeProbe(bool includePortInHostHeader, const char* origin
                 hostHeader.c_str(),
                 originHeader ? originHeader : "<none>");
 
-  if (!probe.connect(serverAddress, wsPort)) {
-    Serial.printf("[wsdiag] probe connect failed host=%s port=%d\n", serverAddress, wsPort);
+  if (!probe.connect(activeHost(), wsPort)) {
+    Serial.printf("[wsdiag] probe connect failed host=%s port=%d\n", activeHost(), wsPort);
     return;
   }
 
@@ -421,10 +444,12 @@ CountFetchResult doFetchOnlineCountBlocking() {
   HTTPClient http;
   WiFiClientSecure client;
   client.setInsecure();
-  String url = "https://" + String(serverAddress) + "/count";
+  String url = "https://" + String(activeHost()) + "/count";
   logHttpRequest("count-fetch", url);
-  http.setConnectTimeout(200);
-  http.setTimeout(250);
+  // Runs on the network worker task, so a longer wait doesn't block the UI.
+  // Sized for a TLS handshake via Cloudflare's edge and the tunnel.
+  http.setConnectTimeout(2000);
+  http.setTimeout(2000);
 
   http.begin(client, url);
   result.httpCode = http.GET();
@@ -459,7 +484,7 @@ UpdateJobResult doFirmwareUpdateCheckBlocking() {
   WiFiClientSecure client;
   client.setInsecure();
 
-  String updateUrl = "https://" + String(serverAddress) + "/api/firmware/latest";
+  String updateUrl = "https://" + String(activeHost()) + "/api/firmware/latest";
   logHttpRequest("firmware-update", updateUrl);
 
   httpUpdate.onProgress(updateProgress);
@@ -512,7 +537,7 @@ void doSendDeviceLogBlocking(const DeviceLogJob& job) {
   HTTPClient http;
   WiFiClientSecure client;
   client.setInsecure();
-  String url = "https://" + String(serverAddress) + "/api/devices/log";
+  String url = "https://" + String(activeHost()) + "/api/devices/log";
   logHttpRequest("device-log", url);
 
   JsonDocument doc;
@@ -524,8 +549,8 @@ void doSendDeviceLogBlocking(const DeviceLogJob& job) {
   String body;
   serializeJson(doc, body);
 
-  http.setConnectTimeout(500);
-  http.setTimeout(500);
+  http.setConnectTimeout(2000);
+  http.setTimeout(2000);
   http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
   int httpCode = http.POST(body);
@@ -1078,7 +1103,7 @@ void sendButtonEvent(const char* eventType) {
   ESP_LOGI(TAG, "Sending: %s", json.c_str());
 
   markTxActivity();
-  webSocket.sendTXT(json);
+  activeWs().sendTXT(json);
 
   // Update local list immediately for responsiveness
   bool found = false;
@@ -1162,6 +1187,52 @@ void connectToWiFi() {
 }
 
 // ---------- WebSocket Event Handler ----------
+// ---------- Server host failover ----------
+// Called on every WS connect: remember the working host across reboots and
+// report it once per boot/switch so the move off doomdns is visible in Grafana.
+void noteWsConnectedHost() {
+  if (activeHostIdx != savedHostIdx) {
+    preferences.begin("app-config", false);
+    preferences.putUChar("hostIdx", activeHostIdx);
+    preferences.end();
+    savedHostIdx = activeHostIdx;
+  }
+  if (!wsConnectedSinceSwitch) {
+    wsConnectedSinceSwitch = true;
+    String msg = String("Connected via host ") + activeHost();
+    Serial.println(msg);
+    queueDeviceLog("INFO", "host", msg.c_str());
+  }
+}
+
+// Called from loop(): move to the next host after wsFailoverAfterMs with WiFi
+// up but no WebSocket. A failed TCP/TLS connect fires no WebSocket event, so
+// this is time-based rather than counting disconnects. Switching is done here,
+// never inside webSocketEvent, because it stops the client that is
+// dispatching the event.
+void maybeFailoverHost(unsigned long now) {
+  if (serverHostCount < 2 || wsConnected || WiFi.status() != WL_CONNECTED) {
+    wsLastConnectedOrSwitchMs = now;
+    return;
+  }
+  if (now - wsLastConnectedOrSwitchMs < wsFailoverAfterMs) {
+    return;
+  }
+
+  const char* fromHost = activeHost();
+  activeWs().disconnect();
+  activeHostIdx = (activeHostIdx + 1) % serverHostCount;
+  wsLastConnectedOrSwitchMs = now;
+  wsConnectedSinceSwitch = false;
+
+  // Kept under DeviceLogJob::message (80 chars).
+  String msg = String("Failover ") + fromHost + " -> " + activeHost();
+  Serial.println(msg);
+  ESP_LOGW(TAG, "%s", msg.c_str());
+  // Queued now, delivered over HTTP to the new host once it is reachable.
+  queueDeviceLog("WARN", "host", msg.c_str());
+}
+
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
         case WStype_DISCONNECTED:
@@ -1180,6 +1251,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
           }
           wsConnected = true;
           wsErrorLogSent = false;
+          noteWsConnectedHost();
           logDiagnostics("ws-connected");
             refreshConnectivityStatus();
             break;
@@ -1316,7 +1388,13 @@ void setup() {
   preferences.begin("app-config", true); // Read-only mode
   String savedId = preferences.getString("userId", "Guest");
   savedId.toCharArray(userId, 40);
+  savedHostIdx = preferences.getUChar("hostIdx", 0);
   preferences.end();
+  if (savedHostIdx >= serverHostCount) {
+    savedHostIdx = 0;  // host list shrank since it was saved
+  }
+  activeHostIdx = savedHostIdx;
+  Serial.printf("Server host: %s\n", activeHost());
 
   logDomainResolution("boot");
   logWebSocketTarget();
@@ -1397,11 +1475,16 @@ void setup() {
   checkFirmwareUpdate(false);
   
   // Init WebSocket
-  webSocket.setExtraHeaders("");
-  webSocket.beginSSL(serverAddress, wsPort, wsPath, "", "");
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
-  webSocket.enableHeartbeat(15000, 3000, 2);
+  // Configure one client per host; begin() only stores settings, nothing
+  // connects until that client's loop() runs.
+  for (uint8_t i = 0; i < serverHostCount; i++) {
+    wsClients[i].setExtraHeaders("");
+    wsClients[i].beginSSL(serverHosts[i], wsPort, wsPath, "", "");
+    wsClients[i].onEvent(webSocketEvent);
+    wsClients[i].setReconnectInterval(5000);
+    wsClients[i].enableHeartbeat(15000, 3000, 2);
+  }
+  wsLastConnectedOrSwitchMs = millis();
   logDiagnostics("websocket-configured");
   runWebSocketHandshakeDiagnostics("setup", true);
 
@@ -1417,10 +1500,11 @@ void fetchOnlineCount() {
 
 // ---------- Arduino loop ----------
 void loop() {
-  webSocket.loop();
+  activeWs().loop();
   processNetworkResults();
 
   unsigned long now = millis();
+  maybeFailoverHost(now);
   while (now - ledLastFrameMs >= ledFrameIntervalMs) {
     ledLastFrameMs += ledFrameIntervalMs;
     ledPhase += 4;
