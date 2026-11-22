@@ -22,8 +22,8 @@ The firmware runs on an ESP32 DevKit and does five things:
 
 1. Connects to the **GamerBell** WebSocket relay (`wss://<host>:443/ws`) and sends `PRESSED`/`RELEASED` events when the physical button is held or released.
 2. Receives button events from other devices and displays active user names on an OLED screen.
-3. Polls `GET /count` every 10 s and shows how many devices are online.
-4. Checks `GET /api/firmware/latest` on boot and every 60 s; self-flashes over the air (OTA) when GamerBell serves a newer binary.
+3. Polls `GET /count` every 30 s (keep-alive connection, 5 s→60 s backoff on misses, error shown only after 3 in a row) and shows how many devices are online.
+4. Checks `GET /api/firmware/latest` on boot and every 5 min; self-flashes over the air (OTA) when GamerBell serves a newer binary.
 5. Drives a 12-LED WS2812B ring with animated states for every connectivity and activity condition.
 6. Reports known failure points (count-fetch errors, WebSocket disconnects/errors, OTA failures) to GamerBell's `POST /api/devices/log` so they're visible in Loki/Grafana instead of only on the local Serial console.
 
