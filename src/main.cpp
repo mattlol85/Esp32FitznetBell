@@ -75,7 +75,9 @@ const uint8_t serverHostCount = sizeof(serverHosts) / sizeof(serverHosts[0]);
 volatile uint8_t activeHostIdx = 0;
 inline const char* activeHost() { return serverHosts[activeHostIdx]; }
 
-const unsigned long wsFailoverAfterMs = 30000; // ~6 reconnect attempts at 5 s
+// ~18 reconnect attempts at 5 s. 30 s was short enough that a weak-signal
+// wobble flipped bells onto the legacy host, where they then stayed.
+const unsigned long wsFailoverAfterMs = 90000;
 unsigned long wsLastConnectedOrSwitchMs = 0;
 uint8_t savedHostIdx = 0;            // value in NVS, to avoid needless flash writes
 bool wsConnectedSinceSwitch = false; // log the host once per boot/switch
@@ -119,19 +121,38 @@ unsigned long rxActivityUntilMs = 0;
 const unsigned long activityWindowMs = 120;
 
 // Update Scheduler
+// Every OTA check is a full TLS handshake. Every 5 minutes is plenty for
+// rollouts and leaves a weak radio free for the WebSocket and count polls.
 unsigned long lastUpdateCheck = 0;
-const unsigned long updateInterval = 60000; // 1 minute (prototype)
+const unsigned long updateInterval = 300000; // 5 minutes (plus one check at boot)
 const unsigned long ledFrameIntervalMs = 16; // ~60 FPS
 
 // Count Polling
-unsigned long lastCountCheck = 0;
-const unsigned long countInterval = 10000; // 10 seconds
-const unsigned long backendRetryDelayMs = 30000; // back off after backend failures
-unsigned long backendRetryAtMs = 0;
+// The count is cosmetic: button traffic rides the WebSocket. So poll gently,
+// ride out transient misses, and only show an error after several in a row.
+const unsigned long countInterval = 30000;      // normal poll
+const unsigned long countRetryBaseMs = 5000;    // first retry after a miss, then doubles
+const unsigned long countRetryMaxMs = 60000;    // backoff ceiling
+const uint8_t countFailuresBeforeError = 3;     // consecutive misses before "API error"
+// Sized for a TLS handshake at 80 MHz through Cloudflare on a weak signal. The
+// old 2 s limit caused most of the -1 / -11 failures seen in Grafana.
+const uint16_t countConnectTimeoutMs = 6000;
+const uint16_t countReadTimeoutMs = 6000;
+unsigned long nextCountAtMs = 0;
+uint8_t countFailStreak = 0;
+bool countEverSucceeded = false;
 const unsigned long wsDiagIntervalMs = 30000;
 unsigned long lastWsDiagMs = 0;
 int onlineCount = 0;
 bool countApiError = false;
+
+// -------- WiFi signal meter --------
+// RSSI is sampled every couple of seconds and smoothed so the bars don't
+// flicker. -1 bars means WiFi is down.
+const unsigned long rssiSampleIntervalMs = 2000;
+unsigned long lastRssiSampleMs = 0;
+int rssiSmoothed = 0;  // dBm; 0 = no sample yet
+int8_t wifiBars = -1;
 
 // -------- Idle LED dim --------
 // After this many ms of READY-mode inactivity, fade LEDs to near-off.
@@ -252,15 +273,16 @@ void logDiagnostics(const char* context) {
 #if ENABLE_DIAGNOSTICS
   String ip = WiFi.localIP().toString();
   Serial.printf(
-    "[diag] %s | wifi=%s ip=%s rssi=%ld ws=%s countErr=%s count=%d retryAt=%lu uptime=%lu\n",
+    "[diag] %s | wifi=%s ip=%s rssi=%ld ws=%s countErr=%s streak=%u count=%d nextCount=%lu uptime=%lu\n",
     context,
     wifiStatusToString(WiFi.status()),
     ip.c_str(),
     WiFi.RSSI(),
     wsConnected ? "connected" : "disconnected",
     countApiError ? "true" : "false",
+    (unsigned)countFailStreak,
     onlineCount,
-    backendRetryAtMs,
+    nextCountAtMs,
     millis()
   );
 #else
@@ -430,57 +452,89 @@ void runWebSocketHandshakeDiagnostics(const char* reason, bool force = false) {
 void updateProgress(int cur, int total);
 void setStatus(String msg);
 void refreshConnectivityStatus();
-void markBackendRetryBackoff();
 void updateScreen();
+void requestScreenUpdate();
+
+// Kept across polls so a live keep-alive connection skips the TLS handshake,
+// which takes seconds at 80 MHz on a weak signal. HTTPClient's destructor stops
+// its client, so both objects must outlive a single poll. Only the network
+// worker task (core 0) touches them.
+WiFiClientSecure countClient;
+HTTPClient countHttp;
+uint8_t countClientHostIdx = 0xFF;
+
+void dropCountConnection() {
+  countHttp.end();
+  countClient.stop();
+}
 
 CountFetchResult doFetchOnlineCountBlocking() {
   CountFetchResult result = {false, false, false, -1, 0};
 
   if (WiFi.status() != WL_CONNECTED) {
     result.wifiDown = true;
+    dropCountConnection();
     return result;
   }
 
-  HTTPClient http;
-  WiFiClientSecure client;
-  client.setInsecure();
-  String url = "https://" + String(activeHost()) + "/count";
+  // A socket to the old host is useless after a failover.
+  uint8_t hostIdx = activeHostIdx;
+  if (countClientHostIdx != hostIdx) {
+    dropCountConnection();
+    countClientHostIdx = hostIdx;
+  }
+  countClient.setInsecure();
+  String url = "https://" + String(serverHosts[hostIdx]) + "/count";
   logHttpRequest("count-fetch", url);
-  // Runs on the network worker task, so a longer wait doesn't block the UI.
-  // Sized for a TLS handshake via Cloudflare's edge and the tunnel.
-  http.setConnectTimeout(2000);
-  http.setTimeout(2000);
 
-  http.begin(client, url);
-  result.httpCode = http.GET();
+  // Two tries at most: if a reused keep-alive socket turns out to be dead,
+  // retry once on a fresh connection. A fresh connection failing is reported
+  // straight away and left to the caller's backoff.
+  for (int attempt = 0; attempt < 2; attempt++) {
+    bool reusing = countClient.connected();
+    countHttp.setReuse(true);
+    countHttp.setConnectTimeout(countConnectTimeoutMs);
+    countHttp.setTimeout(countReadTimeoutMs);
+    countHttp.begin(countClient, url);
+    result.httpCode = countHttp.GET();
 
-  if (result.httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    ESP_LOGI(TAG, "Count response: %s", payload.c_str());
+    if (result.httpCode == HTTP_CODE_OK) {
+      String payload = countHttp.getString();
+      ESP_LOGI(TAG, "Count response: %s", payload.c_str());
 #if ENABLE_DIAGNOSTICS
-    Serial.printf("[count] url=%s payload=%s\n", url.c_str(), payload.c_str());
+      Serial.printf("[count] url=%s reused=%d payload=%s\n", url.c_str(), reusing, payload.c_str());
 #endif
-
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, payload);
-    if (!error) {
-      result.count = doc["count"] | 0;
-      result.success = true;
-    } else {
-      result.parseError = true;
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, payload);
+      if (!error) {
+        result.count = doc["count"] | 0;
+        result.success = true;
+      } else {
+        result.parseError = true;
+      }
+      countHttp.end();  // keeps the socket open for the next poll
+      return result;
     }
-  } else {
-    ESP_LOGW(TAG, "Failed to fetch count, HTTP code: %d", result.httpCode);
+
+    ESP_LOGW(TAG, "Failed to fetch count, HTTP code: %d (reused=%d)", result.httpCode, reusing);
 #if ENABLE_DIAGNOSTICS
-    Serial.printf("[count] url=%s httpCode=%d\n", url.c_str(), result.httpCode);
+    Serial.printf("[count] url=%s reused=%d httpCode=%d\n", url.c_str(), reusing, result.httpCode);
 #endif
+    dropCountConnection();
+    // The server answered (non-2xx): a new socket won't change that.
+    if (!reusing || result.httpCode > 0) {
+      break;
+    }
   }
 
-  http.end();
   return result;
 }
 
 UpdateJobResult doFirmwareUpdateCheckBlocking() {
+  // Free the idle count connection's TLS buffers first, so the OTA client
+  // (plus the WebSocket's) isn't competing with a third TLS session for heap.
+  dropCountConnection();
+
   WiFiClientSecure client;
   client.setInsecure();
 
@@ -614,34 +668,53 @@ void processNetworkResults() {
   portEXIT_CRITICAL(&networkMux);
 
   if (hasCountResult) {
+    unsigned long now = millis();
     if (localCountResult.wifiDown) {
-      if (!countApiError) {
-        countApiError = true;
-        refreshConnectivityStatus();
-      }
+      // WiFi being down is already on screen; it isn't an API failure, so
+      // don't count it toward the error threshold. Just check again soon.
+      nextCountAtMs = now + countRetryBaseMs;
       logDiagnostics("count-skip-no-wifi");
     } else if (localCountResult.success) {
-      if (onlineCount != localCountResult.count || countApiError) {
-        onlineCount = localCountResult.count;
-        countApiError = false;
+      bool changed = onlineCount != localCountResult.count || countApiError || !countEverSucceeded;
+      if (countApiError) {
+        char logMsg[80];
+        snprintf(logMsg, sizeof(logMsg), "count fetch recovered after %u misses, rssi %d",
+                 (unsigned)countFailStreak, (int)WiFi.RSSI());
+        queueDeviceLog("INFO", "count_fetch", logMsg);
+      }
+      onlineCount = localCountResult.count;
+      countEverSucceeded = true;
+      countFailStreak = 0;
+      countApiError = false;
+      nextCountAtMs = now + countInterval;
+      if (changed) {
         refreshConnectivityStatus();
       }
     } else {
       if (localCountResult.parseError) {
         ESP_LOGW(TAG, "Failed to parse count JSON");
       }
-      if (!countApiError) {
+      if (countFailStreak < 255) {
+        countFailStreak++;
+      }
+      // 5 s, 10 s, 20 s, 40 s, then 60 s until it recovers.
+      uint8_t shift = min((uint8_t)(countFailStreak - 1), (uint8_t)4);
+      nextCountAtMs = now + min(countRetryBaseMs << shift, countRetryMaxMs);
+
+      // A miss or two is normal on a weak link, so keep showing the last count
+      // and only flag an error once several polls in a row have failed.
+      if (!countApiError && countFailStreak >= countFailuresBeforeError) {
         countApiError = true;
         refreshConnectivityStatus();
         char logMsg[80];
         if (localCountResult.parseError) {
           snprintf(logMsg, sizeof(logMsg), "count fetch: failed to parse JSON response");
         } else {
-          snprintf(logMsg, sizeof(logMsg), "count fetch failed, HTTP code: %d", localCountResult.httpCode);
+          snprintf(logMsg, sizeof(logMsg), "count fetch failed x%u, HTTP code: %d, rssi %d",
+                   (unsigned)countFailStreak, localCountResult.httpCode, (int)WiFi.RSSI());
         }
         queueDeviceLog("ERROR", "count_fetch", logMsg);
       }
-      markBackendRetryBackoff();
     }
   }
 
@@ -762,6 +835,61 @@ void drawGameBeacon(int16_t x, int16_t y) {
   }
 }
 
+// RSSI (dBm) to 0-4 bars. Below about -83 dBm the link is barely usable.
+int8_t rssiToBars(int rssi) {
+  if (rssi >= -60) return 4;
+  if (rssi >= -67) return 3;
+  if (rssi >= -75) return 2;
+  if (rssi >= -83) return 1;
+  return 0;
+}
+
+// Classic 4-bar signal meter, 11x8 px, top-left corner at (x, y). Unlit bars
+// keep a 1 px stub so the meter's shape stays visible; WiFi down draws an X.
+void drawWifiMeter(int16_t x, int16_t y) {
+  const int16_t bottom = y + 7;
+  if (wifiBars < 0) {
+    display.drawLine(x + 2, y + 1, x + 8, y + 7, SSD1306_WHITE);
+    display.drawLine(x + 2, y + 7, x + 8, y + 1, SSD1306_WHITE);
+    return;
+  }
+  for (int8_t i = 0; i < 4; i++) {
+    int16_t bx = x + i * 3;
+    int16_t h = 2 + i * 2;  // 2, 4, 6, 8 px
+    if (i < wifiBars) {
+      display.fillRect(bx, bottom - h + 1, 2, h, SSD1306_WHITE);
+    } else {
+      display.drawFastHLine(bx, bottom, 2, SSD1306_WHITE);
+    }
+  }
+}
+
+// Called from loop(): sample RSSI, smooth it, and redraw only when the bar
+// count changes.
+void updateWifiMeter(unsigned long now) {
+  if (now - lastRssiSampleMs < rssiSampleIntervalMs) {
+    return;
+  }
+  lastRssiSampleMs = now;
+
+  int8_t bars;
+  if (WiFi.status() != WL_CONNECTED) {
+    rssiSmoothed = 0;
+    bars = -1;
+  } else {
+    int rssi = WiFi.RSSI();
+    if (rssi < 0) {  // 0 means "no reading"
+      rssiSmoothed = (rssiSmoothed == 0) ? rssi : (rssiSmoothed * 3 + rssi) / 4;
+    }
+    bars = (rssiSmoothed == 0) ? 0 : rssiToBars(rssiSmoothed);
+  }
+
+  if (bars != wifiBars) {
+    wifiBars = bars;
+    requestScreenUpdate();
+  }
+}
+
 void updateScreen() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -770,6 +898,7 @@ void updateScreen() {
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.println("Fitz-Net Bell");
+  drawWifiMeter(SCREEN_WIDTH - 11, 0);
   display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
 
   // Main Body
@@ -818,7 +947,16 @@ void updateScreen() {
   display.setCursor(0, 54);
   display.setTextSize(1);
   if (countApiError) {
-    display.println("Online: API error");
+    // Keep the last good count, marked stale, rather than a scary error.
+    if (countEverSucceeded) {
+      display.print("Online: ");
+      display.print(onlineCount);
+      display.println("?");
+    } else {
+      display.println("Online: --");
+    }
+  } else if (!countEverSucceeded) {
+    display.println("Online: ...");
   } else {
     display.print("Online: ");
     display.println(onlineCount);
@@ -1065,10 +1203,6 @@ void logConnectionError(const String& msg) {
   }
 }
 
-void markBackendRetryBackoff() {
-  backendRetryAtMs = millis() + backendRetryDelayMs;
-}
-
 void refreshConnectivityStatus() {
   if (WiFi.status() != WL_CONNECTED) {
     logConnectionError("WiFi Disconnected");
@@ -1199,7 +1333,7 @@ void noteWsConnectedHost() {
   }
   if (!wsConnectedSinceSwitch) {
     wsConnectedSinceSwitch = true;
-    String msg = String("Connected via host ") + activeHost();
+    String msg = String("Connected via host ") + activeHost() + ", rssi " + String((int)WiFi.RSSI());
     Serial.println(msg);
     queueDeviceLog("INFO", "host", msg.c_str());
   }
@@ -1238,7 +1372,9 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         case WStype_DISCONNECTED:
           if (wsConnected) {
             ESP_LOGW(TAG, "WS Disconnected");
-            queueDeviceLog("WARN", "websocket", "WebSocket disconnected");
+            char logMsg[80];
+            snprintf(logMsg, sizeof(logMsg), "WebSocket disconnected, rssi %d", (int)WiFi.RSSI());
+            queueDeviceLog("WARN", "websocket", logMsg);
           }
           wsConnected = false;
           logDiagnostics("ws-disconnected");
@@ -1252,6 +1388,11 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
           wsConnected = true;
           wsErrorLogSent = false;
           noteWsConnectedHost();
+          // The link is evidently back: refresh a stale or missing count now
+          // instead of waiting out the backoff.
+          if (countFailStreak > 0 || !countEverSucceeded) {
+            nextCountAtMs = millis();
+          }
           logDiagnostics("ws-connected");
             refreshConnectivityStatus();
             break;
@@ -1469,9 +1610,12 @@ void setup() {
   );
 
   connectToWiFi();
-  // Modem sleep: radio powers down between DTIM beacon intervals (~100ms).
-  // WebSocket and HTTP continue to work; saves ~100–200mA during idle.
-  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  // Keep the radio awake. Modem sleep saved some idle current, but on a weak
+  // link it delays and drops frames, which stretched TLS handshakes past their
+  // timeouts and made WebSocket pongs miss. Costs ~100 mA idle, which assumes
+  // the bell runs on USB/mains rather than a battery.
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setAutoReconnect(true);
   checkFirmwareUpdate(false);
   
   // Init WebSocket
@@ -1482,7 +1626,10 @@ void setup() {
     wsClients[i].beginSSL(serverHosts[i], wsPort, wsPath, "", "");
     wsClients[i].onEvent(webSocketEvent);
     wsClients[i].setReconnectInterval(5000);
-    wsClients[i].enableHeartbeat(15000, 3000, 2);
+    // Ping every 20 s; drop only after 3 pongs in a row miss a 10 s window.
+    // The old 3 s x 2 tolerated almost no latency, so weak links reconnected
+    // ~28 times a day.
+    wsClients[i].enableHeartbeat(20000, 10000, 3);
   }
   wsLastConnectedOrSwitchMs = millis();
   logDiagnostics("websocket-configured");
@@ -1515,22 +1662,25 @@ void loop() {
   // Flush any pending OLED redraw, throttled so the blocking I2C push can't
   // starve the LED frame loop above.
   updateGameBeacon(now);
+  updateWifiMeter(now);
   if (displayDirty && (now - lastDisplayFlushMs) >= displayMinIntervalMs) {
     updateScreen();
     now = millis();
   }
 
   // Check for updates periodically
-  if (now - lastUpdateCheck >= updateInterval && now >= backendRetryAtMs) {
+  if (now - lastUpdateCheck >= updateInterval) {
     if (!buttonPressed && now >= txActivityUntilMs && now >= rxActivityUntilMs) {
       lastUpdateCheck = now;
       checkFirmwareUpdate(true);
     }
   }
 
-  // Poll online count periodically
-  if (now - lastCountCheck >= countInterval && now >= backendRetryAtMs) {
-    lastCountCheck = now;
+  // Poll online count. nextCountAtMs is set by the last result (normal
+  // interval or backoff); the provisional value here only matters if the
+  // request is dropped because a fetch is already in flight.
+  if ((long)(now - nextCountAtMs) >= 0) {
+    nextCountAtMs = now + countInterval;
     fetchOnlineCount();
   }
 

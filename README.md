@@ -7,10 +7,10 @@ It is one of five sibling repos in the Fitz-Net platform. It speaks the same Web
 ## Features
 
 - **Real-time communication** — Connects to the GamerBell relay over a secure WebSocket (WSS) to send and receive button events instantly.
-- **OTA firmware updates** — On boot and once per minute (while idle), the device checks `GET /api/firmware/latest` and silently flashes itself if a newer build is available. No USB needed after the first flash.
+- **OTA firmware updates** — On boot and every 5 minutes (while idle), the device checks `GET /api/firmware/latest` and silently flashes itself if a newer build is available. No USB needed after the first flash.
 - **WS2812B LED ring** — A 12-LED ring shows rich animated feedback for every state: booting, Wi-Fi down, backend/WebSocket down, updating (progress bar), TX/RX traffic, button held, active users, and idle "ready" breathing.
-- **OLED display** — Shows device status, connection state, the names of users currently holding their button, and a live count of online devices.
-- **Online count** — Polls `GET /count` every 10 seconds and displays how many devices are connected to the relay.
+- **OLED display** — Shows device status, connection state, the names of users currently holding their button, and a live count of online devices, plus a 4-bar Wi-Fi signal meter in the top-right corner.
+- **Online count** — Polls `GET /count` every 30 seconds over a reused keep-alive connection and displays how many devices are connected to the relay. A miss retries after 5, 10, 20, 40, then 60 s; the screen keeps the last count and only flags it (`Online: N?`) after 3 misses in a row.
 - **Non-blocking networking** — HTTP count polling and OTA update checks run on a dedicated FreeRTOS task pinned to core 0, so the UI and LED animations stay smooth.
 - **Easy setup** — A Wi-Fi captive portal (WiFiManager) handles Wi-Fi credentials and the device's user name on first boot; both are persisted to NVS.
 - **Optional diagnostics** — A compile-time flag enables verbose Wi-Fi / DNS / HTTP / WebSocket-handshake logging for troubleshooting.
@@ -72,7 +72,7 @@ The device talks to three endpoints on this host:
 | Endpoint | Purpose |
 |---|---|
 | `wss://<host>:443/ws` | WebSocket for button press/release events |
-| `https://<host>/count` | Online device count (polled every 10s) |
+| `https://<host>/count` | Online device count (polled every 30s, with backoff) |
 | `https://<host>/api/firmware/latest` | OTA firmware image |
 
 > TLS certificates are accepted with `setInsecure()` (no cert pinning), which is appropriate for this personal-platform setup.
